@@ -382,17 +382,6 @@ impl ComparisonView {
                 "comparison cursor belongs to another query",
             ));
         }
-        let prefix = if met == 0 { "l" } else { "a" };
-        let column = format!(
-            "{prefix}{}",
-            if mode == 0 {
-                "rank"
-            } else if mode == 2 {
-                "dec"
-            } else {
-                "inc"
-            }
-        );
         let (lo, hi) = if let Some(id) = scope {
             self.conn()
                 .query_row("SELECT lo,hi FROM pairs WHERE id=?", [id.0], |r| {
@@ -401,21 +390,7 @@ impl ComparisonView {
         } else {
             (0, i64::MAX)
         };
-        let condition = if mode == 0 {
-            "parent=?1"
-        } else if mode == 3 {
-            "lo BETWEEN ?2 AND ?3 AND directory=1"
-        } else {
-            "lo BETWEEN ?2 AND ?3"
-        };
-        let positive = if mode == 0 {
-            String::new()
-        } else {
-            format!("AND {column}>0")
-        };
-        let sql = format!(
-            "SELECT id,{column} FROM pairs WHERE visible=1 AND {condition} {positive} AND ({column}<?4 OR ({column}=?4 AND id>?5)) ORDER BY {column} DESC,id LIMIT ?6"
-        );
+        let sql = page_sql(metric, mode);
         let mut stmt = self.conn().prepare(&sql)?;
         let rows = stmt
             .query_map(
@@ -494,4 +469,36 @@ fn changed(b: Option<&StoredEntry>, a: Option<&StoredEntry>) -> Option<bool> {
     } else {
         Some(false)
     }
+}
+
+/// Equal-rank pages must seek both keys; an OR predicate bounds only rank and
+/// rescans earlier ties. Negated positive IDs preserve ascending-ID tie order
+/// while allowing one descending composite-key range.
+pub(super) fn page_sql(metric: Metric, mode: u8) -> String {
+    let prefix = if metric == Metric::Logical { "l" } else { "a" };
+    let column = format!(
+        "{prefix}{}",
+        if mode == 0 {
+            "rank"
+        } else if mode == 2 {
+            "dec"
+        } else {
+            "inc"
+        }
+    );
+    let condition = if mode == 0 {
+        "parent=?1"
+    } else if mode == 3 {
+        "lo BETWEEN ?2 AND ?3 AND directory=1"
+    } else {
+        "lo BETWEEN ?2 AND ?3"
+    };
+    let positive = if mode == 0 {
+        String::new()
+    } else {
+        format!("AND {column}>0")
+    };
+    format!(
+        "SELECT id,{column} FROM pairs WHERE visible=1 AND {condition} {positive} AND ({column},neg_id)<(?4,-?5) ORDER BY {column} DESC,neg_id DESC LIMIT ?6"
+    )
 }

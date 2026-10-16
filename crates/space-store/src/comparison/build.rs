@@ -128,7 +128,7 @@ impl ComparisonView {
         let token = cancel.clone();
         c.progress_handler(1000, Some(move || token.is_cancelled()))?;
         c.execute_batch("PRAGMA query_only=OFF; PRAGMA temp_store=FILE; BEGIN;
-   CREATE TEMP TABLE pairs(id INTEGER PRIMARY KEY,parent INTEGER,before_node INTEGER UNIQUE,after_node INTEGER UNIQUE,bp INTEGER NOT NULL,ap INTEGER NOT NULL,depth INTEGER NOT NULL,display TEXT NOT NULL,witness BLOB,directory INTEGER NOT NULL,summary BLOB NOT NULL,change BLOB NOT NULL,visible INTEGER NOT NULL DEFAULT 0,selected INTEGER NOT NULL DEFAULT 0,redistributed INTEGER NOT NULL DEFAULT 0,lo INTEGER NOT NULL DEFAULT 0,hi INTEGER NOT NULL DEFAULT 0,linc INTEGER NOT NULL DEFAULT 0,ldec INTEGER NOT NULL DEFAULT 0,lrank INTEGER NOT NULL DEFAULT 0,ainc INTEGER NOT NULL DEFAULT 0,adec INTEGER NOT NULL DEFAULT 0,arank INTEGER NOT NULL DEFAULT 0);
+   CREATE TEMP TABLE pairs(id INTEGER PRIMARY KEY,neg_id INTEGER GENERATED ALWAYS AS (-id) STORED,parent INTEGER,before_node INTEGER UNIQUE,after_node INTEGER UNIQUE,bp INTEGER NOT NULL,ap INTEGER NOT NULL,depth INTEGER NOT NULL,display TEXT NOT NULL,witness BLOB,directory INTEGER NOT NULL,summary BLOB NOT NULL,change BLOB NOT NULL,visible INTEGER NOT NULL DEFAULT 0,selected INTEGER NOT NULL DEFAULT 0,redistributed INTEGER NOT NULL DEFAULT 0,lo INTEGER NOT NULL DEFAULT 0,hi INTEGER NOT NULL DEFAULT 0,linc INTEGER NOT NULL DEFAULT 0,ldec INTEGER NOT NULL DEFAULT 0,lrank INTEGER NOT NULL DEFAULT 0,ainc INTEGER NOT NULL DEFAULT 0,adec INTEGER NOT NULL DEFAULT 0,arank INTEGER NOT NULL DEFAULT 0);
    CREATE INDEX pair_parent ON pairs(parent,id); CREATE INDEX pair_witness ON pairs(witness);
    CREATE TEMP TABLE groups(identity BLOB PRIMARY KEY,before_node INTEGER NOT NULL,after_node INTEGER NOT NULL); CREATE TEMP TABLE blockers(scan INTEGER NOT NULL,parent INTEGER NOT NULL,native BLOB); CREATE INDEX blocked_scope ON blockers(scan,parent,native);")?;
         // Without the identity index SQLite may prefer the three-column
@@ -425,7 +425,7 @@ impl ComparisonView {
                 stack.pop();
             }
         }
-        c.execute_batch("CREATE INDEX comparison_lchildren ON pairs(parent,visible,lrank DESC,id); CREATE INDEX comparison_achildren ON pairs(parent,visible,arank DESC,id); CREATE INDEX comparison_lincrease ON pairs(visible,linc DESC,id); CREATE INDEX comparison_ldecrease ON pairs(visible,ldec DESC,id); CREATE INDEX comparison_aincrease ON pairs(visible,ainc DESC,id); CREATE INDEX comparison_adecrease ON pairs(visible,adec DESC,id); CREATE INDEX comparison_subtree ON pairs(lo,hi);")?;
+        c.execute_batch("CREATE INDEX comparison_lchildren ON pairs(parent,visible,lrank DESC,neg_id DESC); CREATE INDEX comparison_achildren ON pairs(parent,visible,arank DESC,neg_id DESC); CREATE INDEX comparison_lincrease ON pairs(visible,linc DESC,neg_id DESC); CREATE INDEX comparison_ldecrease ON pairs(visible,ldec DESC,neg_id DESC); CREATE INDEX comparison_aincrease ON pairs(visible,ainc DESC,neg_id DESC); CREATE INDEX comparison_adecrease ON pairs(visible,adec DESC,neg_id DESC); CREATE INDEX comparison_subtree ON pairs(lo,hi);")?;
         Ok(())
     }
 }

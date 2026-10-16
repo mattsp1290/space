@@ -979,6 +979,119 @@ fn comparison_pages_are_stable_bounded_and_lossless_with_tied_values() {
 }
 
 #[test]
+fn comparison_tied_pages_cover_both_directions_directories_and_subtrees() {
+    let _process_gate = crate::tests::PROCESS_GATE.read().unwrap();
+    let mut c = Cache::open(dir()).unwrap();
+    for n in 1..=2 {
+        let mut records = vec![entry(1, None, b"root", None, false)];
+        for directory in 0..3 {
+            let parent = 2 + directory * 5;
+            records.push(entry(
+                parent,
+                Some(1),
+                format!("dir-{directory}").as_bytes(),
+                None,
+                false,
+            ));
+            for file in 0..4 {
+                let growing = file < 2;
+                let size = if (n == 2) == growing { 20 } else { 10 };
+                records.push(observed_file(
+                    parent + file + 1,
+                    parent,
+                    format!(
+                        "{}-{directory}-{file}",
+                        if growing { "grow" } else { "shrink" }
+                    )
+                    .as_bytes(),
+                    Some(size),
+                    parent + file + 1,
+                ));
+            }
+            records.push(finished(parent));
+        }
+        records.push(finished(1));
+        snapshot(&mut c, n, records);
+    }
+    let view = comparison(&c);
+    let root = view.root().unwrap();
+    assert_change(root.logical, 180, 180, 0, 60, 60);
+    let first_directory = child(&view, root.id, "dir-0");
+    for metric in [Metric::Logical, Metric::Allocated] {
+        for mode in 0..4 {
+            for subtree in [false, true] {
+                let scope = if subtree {
+                    Some(first_directory.id)
+                } else {
+                    None
+                };
+                let query = |cursor, limit| match mode {
+                    0 => view.children(scope.unwrap_or(root.id), metric, cursor, limit),
+                    1 => view.largest(scope, metric, ChangeDirection::Increase, cursor, limit),
+                    2 => view.largest(scope, metric, ChangeDirection::Decrease, cursor, limit),
+                    _ => view.growing_directories(scope, metric, cursor, limit),
+                };
+                let expected = query(None, 50).unwrap().entries;
+                let expected_names: std::collections::BTreeSet<_> =
+                    expected.iter().map(|row| display(row).to_owned()).collect();
+                let mut names = std::collections::BTreeSet::new();
+                if mode == 0 {
+                    if subtree {
+                        for file in 0..4 {
+                            names.insert(format!(
+                                "{}-0-{file}",
+                                if file < 2 { "grow" } else { "shrink" }
+                            ));
+                        }
+                    } else {
+                        for directory in 0..3 {
+                            names.insert(format!("dir-{directory}"));
+                        }
+                    }
+                } else {
+                    if !subtree {
+                        names.insert("root".to_owned());
+                    }
+                    for directory in 0..if subtree { 1 } else { 3 } {
+                        names.insert(format!("dir-{directory}"));
+                        if mode != 3 {
+                            for file in if mode == 1 { 0..2 } else { 2..4 } {
+                                names.insert(format!(
+                                    "{}-{directory}-{file}",
+                                    if mode == 1 { "grow" } else { "shrink" }
+                                ));
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    expected_names, names,
+                    "mode {mode}, subtree {subtree}, metric {metric:?}"
+                );
+                let expected: Vec<_> = expected.into_iter().map(|row| row.id.get()).collect();
+                for size in [1, 2, 3, 7] {
+                    let mut actual = Vec::new();
+                    let mut cursor = None;
+                    loop {
+                        let page = query(cursor, size).unwrap();
+                        actual.extend(page.entries.into_iter().map(|row| row.id.get()));
+                        cursor = page.next;
+                        if cursor.is_none() {
+                            break;
+                        }
+                        assert!(actual.len() <= expected.len(), "cursor repeated tied rows");
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "mode {mode}, subtree {subtree}, page size {size}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn comparison_pins_both_scans_and_keeps_main_database_read_only() {
     let _process_gate = crate::tests::PROCESS_GATE.read().unwrap();
     let mut c = arithmetic_fixture();
@@ -1449,6 +1562,115 @@ fn comparison_owner_join_uses_identity_lookup_in_actual_query_plan() {
 }
 
 #[test]
+fn comparison_actual_page_queries_seek_full_tuple_with_bounded_late_tie_work() {
+    let _process_gate = crate::tests::PROCESS_GATE.read().unwrap();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cache = arithmetic_fixture();
+    let view = comparison(&cache);
+    let connection = &view.reader.cache.conn;
+    let (summary, change): (Vec<u8>, Vec<u8>) = connection
+        .query_row("SELECT summary,change FROM pairs WHERE id=1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    // Populate only the view's disposable TEMP table, using its actual schema
+    // and indexes. Main snapshots remain read-only and unchanged.
+    connection.execute("DELETE FROM pairs", []).unwrap();
+    connection.execute_batch("BEGIN").unwrap();
+    {
+        let mut insert = connection.prepare("INSERT INTO pairs(id,parent,bp,ap,depth,display,directory,summary,change,visible,selected,lo,hi,linc,ldec,lrank,ainc,adec,arank) VALUES(?1,1,0,0,1,'tie',1,?2,?3,1,1,?1,?1,1,1,1,1,1,1)").unwrap();
+        for id in 1..=20_000 {
+            insert.execute(params![id, &summary, &change]).unwrap();
+        }
+    }
+    connection.execute_batch("COMMIT").unwrap();
+    for rank in [1, i64::MAX] {
+        connection
+            .execute(
+                "UPDATE pairs SET linc=?1,ldec=?1,lrank=?1,ainc=?1,adec=?1,arank=?1",
+                [rank],
+            )
+            .unwrap();
+        for metric in [Metric::Logical, Metric::Allocated] {
+            for mode in 0..4 {
+                let sql = crate::comparison::page_sql(metric, mode);
+                let details = connection
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map(params![1, 1, 20_000, rank, 19_000, 501], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    details
+                        .iter()
+                        .any(|line| line.contains("neg_id") && line.contains("<(?,?)")),
+                    "page must seek the full rank/id tuple: {details:?}"
+                );
+                assert!(
+                    !details.iter().any(|line| line.contains("TEMP B-TREE")),
+                    "page order must use its index: {details:?}"
+                );
+                let mut samples = Vec::new();
+                for cursor in [0, 501, 19_000] {
+                    let steps = Arc::new(AtomicUsize::new(0));
+                    let count = steps.clone();
+                    connection
+                        .progress_handler(
+                            100,
+                            Some(move || {
+                                count.fetch_add(100, Ordering::Relaxed);
+                                false
+                            }),
+                        )
+                        .unwrap();
+                    let rows = connection
+                        .prepare(&sql)
+                        .unwrap()
+                        .query_map(params![1, 1, 20_000, rank, cursor, 501], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap();
+                    connection
+                        .progress_handler(0, None::<fn() -> bool>)
+                        .unwrap();
+                    assert_eq!(rows, ((cursor + 1)..=(cursor + 501)).collect::<Vec<_>>());
+                    samples.push(steps.load(Ordering::Relaxed));
+                }
+                assert!(
+                    samples[2] < 20_000,
+                    "late tied page rescanned its prefix: {samples:?}, mode {mode}, metric {metric:?}"
+                );
+                assert!(
+                    samples[2] <= samples[0] + 2_000,
+                    "late tied page did substantially more work than first page: {samples:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        cache
+            .root_entry(spec(1).key.id)
+            .unwrap()
+            .logical
+            .observed_bytes,
+        160
+    );
+    assert_eq!(
+        cache
+            .root_entry(spec(2).key.id)
+            .unwrap()
+            .logical
+            .observed_bytes,
+        165
+    );
+}
+
+#[test]
 fn comparison_active_cancellation_releases_both_pins_and_reports_terminal_phase() {
     let _process_gate = crate::tests::PROCESS_GATE.read().unwrap();
     let mut c = Cache::open(dir()).unwrap();
@@ -1654,19 +1876,34 @@ fn comparison_wide_release_benchmark() {
     }
     samples.sort();
     println!("comparison_wide_top100_warm_p95={:?}", samples[18]);
+    let paging_started = std::time::Instant::now();
+    let mut late_page_samples = Vec::new();
     let mut cursor = None;
     let mut children = 0;
     loop {
+        let page_started = std::time::Instant::now();
         let page = view
             .children(root.id, Metric::Logical, cursor, MAX_PAGE_SIZE)
             .unwrap();
         children += page.entries.len();
+        if children as u64 > files.saturating_sub(10_000) {
+            late_page_samples.push(page_started.elapsed());
+        }
         cursor = page.next;
         if cursor.is_none() {
             break;
         }
     }
     assert_eq!(children, files as usize);
+    println!(
+        "comparison_wide_all_children={:?} rows={children}",
+        paging_started.elapsed()
+    );
+    late_page_samples.sort();
+    println!(
+        "comparison_wide_last500_warm_p95={:?}",
+        late_page_samples[(late_page_samples.len() * 95 / 100).saturating_sub(1)]
+    );
     #[cfg(target_os = "linux")]
     for line in std::fs::read_to_string("/proc/self/status")
         .unwrap()

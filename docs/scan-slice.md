@@ -97,12 +97,18 @@ historical contents or a restored file.
 Changes is under native CI validation. No million-entry comparison benchmark or
 physical GUI acceptance is claimed by the existing scanner/filter measurements.
 
-A development comparison fixture with 100,000 entries took 35.011 seconds to
+Before the full-key pagination correction, a development comparison fixture
+with 100,000 entries took 35.011 seconds to
 build its disk-backed working view after correcting an adverse SQLite join plan;
 warm top-100 p95 was 46.346 ms with 35,832 KiB peak RSS. Complete pagination
-visited all 100,000 records. This exact-source replay ran alongside other
+visited all 100,000 records. That source replay ran alongside other
 verification; a previous sample measured 30.461 s / 9.345 ms, showing container
 variability. A 500-level fixture built in 112.857 ms and queried its subtree in
 0.221 ms. This is cloud development evidence, not a
 million-entry or reference-machine acceptance result. Comparison construction can
 be lengthy, so phase progress/cancellation and retained prior views are required.
+
+Equal-rank comparison pages now seek the complete rank/identity tuple. Production-
+SQL regressions cover first/late pages, both metrics, all four views and maximum
+ranks, preserving stable ascending identity order without rescanning earlier ties.
+Post-correction large-fixture measurements are pending.
