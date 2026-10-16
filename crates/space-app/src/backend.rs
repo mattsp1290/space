@@ -536,18 +536,21 @@ pub fn remove_cached(backend: &Backend, scan: Option<ScanId>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "space-app-test-{}-{}",
+                "space-app-test-{}-{}-{}",
                 std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_nanos()
             ));
-            std::fs::create_dir_all(&path).unwrap();
+            // Never silently reuse another test's directory on coarse Windows clocks.
+            std::fs::create_dir(&path).unwrap();
             Self(path.canonicalize().unwrap())
         }
     }
@@ -555,6 +558,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn parallel_fixture_directories_are_distinct() {
+        let handles: Vec<_> = (0..32).map(|_| std::thread::spawn(Fixture::new)).collect();
+        let fixtures: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let paths: std::collections::HashSet<_> =
+            fixtures.iter().map(|fixture| &fixture.0).collect();
+        assert_eq!(paths.len(), fixtures.len());
     }
     #[test]
     fn comparison_preserves_endpoint_paths_pins_and_cancelled_prior_view() {
