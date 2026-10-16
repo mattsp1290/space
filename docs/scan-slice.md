@@ -28,8 +28,10 @@ are read, uploaded or deleted by scanning. Temporary fixture tests own their dat
 - Filters retain the previous view while their separate worker computes results.
   Empty filters use indexed base queries directly. Pages contain at most 100 rows;
   treemap Other includes all omitted weight and opens the full paged child scope.
-- Windows traversal currently fails native CI at directory ReOpenFile (OS error 87).
-  This is an open implementation blocker, not a passing platform claim.
+- Windows held-directory traversal now passes native fixtures after replacing the
+  unsupported directory ReOpenFile call with a checked NtCreateFile handle open.
+  A corrected real sharing-conflict regression awaits exact-head CI; complete
+  Windows acceptance is not yet claimed.
 - No root path component may be a symlink/reparse redirect. On macOS, explicitly
   select the canonical location instead of an alias such as `/tmp` or `/var`.
 - Linux requires statx mount IDs under the default policy and allows only known

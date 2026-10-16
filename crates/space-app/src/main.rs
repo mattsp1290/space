@@ -95,7 +95,7 @@ struct Space {
     focus: FocusHandle,
     list_focus: FocusHandle,
     scroll: UniformListScrollHandle,
-    backend: Option<Backend>,
+    backend: Option<deferred::Deferred<Backend>>,
     cache_directory: Option<PathBuf>,
     snapshot: Option<Arc<Snapshot>>,
     pending_snapshot: Option<Arc<Snapshot>>,
@@ -623,16 +623,26 @@ impl Space {
             }
         };
         self.cache_directory = Some(directory.clone());
-        let task = cx
-            .background_executor()
-            .spawn(async move { backend::open(&directory) });
+        let executor = cx.background_executor().clone();
+        let task = cx.background_executor().spawn(async move {
+            backend::open(&directory).map(|opened| {
+                let backend = deferred::Deferred::new(Arc::new(opened.backend), move |value| {
+                    executor
+                        .spawn(async move {
+                            drop(value);
+                        })
+                        .detach();
+                });
+                (backend, opened.roots, opened.snapshot)
+            })
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(opened) => {
-                        this.backend = Some(opened.backend); this.roots = opened.roots;
-                        if let Some(snapshot) = opened.snapshot { this.apply_snapshot(snapshot, cx); }
+                    Ok((backend, roots, snapshot)) => {
+                        this.backend = Some(backend); this.roots = roots;
+                        if let Some(snapshot) = snapshot { this.apply_snapshot(snapshot, cx); }
                         else { this.status = "Choose a folder, then Scan / Refresh. No source drive is scanned automatically.".into(); }
                     }
                     Err(error) => this.status = format!("Cache unavailable: {error}. Original data was not replaced."),

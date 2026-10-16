@@ -85,7 +85,8 @@ pub(crate) fn open_child(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
     let file = metadata_file(parent, name)?;
     require_directory(observation(&file)?)?;
     // metadata_file omits FILE_SHARE_DELETE, as required by cap-std's Windows
-    // Dir::from_std_file contract to pin the directory against rename/delete.
+    // Dir::from_std_file contract. Metadata-only handles may be exempt from
+    // share checks; traversal relies on retained objects, not path stability.
     Ok(Dir::from_std_file(file))
 }
 
@@ -272,8 +273,8 @@ fn reopen_directory_for_listing(directory: BorrowedHandle<'_>) -> io::Result<std
     };
     let mut status_block = IO_STATUS_BLOCK::default();
     let mut raw = INVALID_HANDLE_VALUE;
-    // SAFETY: directory is borrowed from a live, validated, no-delete-share
-    // directory owner. name, its initialized UTF-16 buffer, attributes, raw, and
+    // SAFETY: directory is borrowed from a live, validated directory owner.
+    // name, its initialized UTF-16 buffer, attributes, raw, and
     // status_block all remain valid for this synchronous call. FILE_OPEN cannot
     // create/overwrite anything. DIRECTORY_FILE excludes regular-file data;
     // OPEN_REPARSE_POINT suppresses redirection. Only listing, attributes, and
@@ -1074,20 +1075,110 @@ mod tests {
     }
 
     #[test]
-    fn native_sharing_failure_is_an_error_not_zero_size() {
+    fn native_listing_sharing_failure_produces_failed_coverage() {
         use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_SHARE_DELETE};
+        use windows_sys::Win32::Foundation::STATUS_SHARING_VIOLATION;
         let fixture = Fixture::new();
         let path = fixture.0.join("locked");
-        std::fs::write(&path, [1_u8; 12]).unwrap();
-        // A live DELETE-access handle conflicts with our no-delete-sharing
-        // policy, even though the scanner asks for no data access at all.
-        let _locked = std::fs::OpenOptions::new()
-            .access_mode(DELETE)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .open(path)
+        std::fs::create_dir(&path).unwrap();
+        let root = fixture.dir();
+        let child = open_child(&root, OsStr::new("locked")).unwrap();
+        // Metadata-only opens may bypass share checks. A held LIST_DIRECTORY
+        // handle with no sharing actually conflicts with our listing reopen.
+        let locked = std::fs::OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
             .unwrap();
-        assert!(observe(&fixture.dir(), OsStr::new("locked")).is_err());
+        assert!(directory(&child).is_ok());
+        let error = entries(&child)
+            .err()
+            .expect("listing must conflict with exclusive directory handle");
+        assert!(
+            error
+                .to_string()
+                .contains("NtCreateFile(held directory listing)")
+        );
+        let sharing_status = format!("NTSTATUS {STATUS_SHARING_VIOLATION:#010x}");
+        assert!(error.to_string().contains(&sharing_status), "{error}");
+        // Rust does not consistently classify sharing violations as permission
+        // errors. Preserve the actual runtime mapping at the scanner boundary.
+        let expected_issue_class = crate::io_class(&error);
+
+        let spec = ScanSpec {
+            key: ScanKey {
+                id: ScanId::new(1).unwrap(),
+                generation: 1,
+            },
+            root_id: RootId::new(1).unwrap(),
+            lineage_id: LineageId::new(1).unwrap(),
+            expected_root: crate::inspect_root(&path).unwrap(),
+            policy: ScanPolicy::default(),
+        };
+        let collect = || {
+            let mut records = Vec::new();
+            crate::scan(
+                &path,
+                &spec,
+                &Cancellation::new(),
+                crate::ScanLimits::default(),
+                |batch| {
+                    records.extend(batch.records);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            records
+        };
+        let records = collect();
+        assert!(
+            records.iter().any(|record| matches!(record,
+            ScanRecord::Issue(issue) if issue.class == expected_issue_class
+                && issue.detail.contains("NtCreateFile(held directory listing)")
+                && issue.detail.contains(&sharing_status))),
+            "{records:?}"
+        );
+        assert!(
+            records.iter().any(|record| matches!(
+                record,
+                ScanRecord::DirectoryFinished {
+                    enumeration: EnumerationState::Failed,
+                    ..
+                }
+            )),
+            "{records:?}"
+        );
+        assert!(
+            !records.iter().any(|record| matches!(
+                record,
+                ScanRecord::DirectoryFinished {
+                    enumeration: EnumerationState::Complete,
+                    ..
+                }
+            )),
+            "{records:?}"
+        );
+
+        drop(locked);
+        assert!(entries(&child).unwrap().next().is_none());
+        let records = collect();
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record, ScanRecord::Issue(_))),
+            "{records:?}"
+        );
+        assert!(
+            records.iter().any(|record| matches!(
+                record,
+                ScanRecord::DirectoryFinished {
+                    enumeration: EnumerationState::Complete,
+                    ..
+                }
+            )),
+            "{records:?}"
+        );
     }
 
     #[test]

@@ -42,6 +42,42 @@ impl<T: Send + Sync + 'static> Drop for Deferred<T> {
 mod tests {
     use super::*;
     #[test]
+    fn abandoned_initialization_result_and_window_backend_retire_on_worker() {
+        struct Connection(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for Connection {
+            fn drop(&mut self) {
+                self.0.send(std::thread::current().id()).unwrap();
+            }
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (retire_tx, retire_rx) = std::sync::mpsc::channel::<Arc<Connection>>();
+        let worker = std::thread::spawn(move || {
+            let id = std::thread::current().id();
+            for resource in retire_rx {
+                drop(resource);
+            }
+            id
+        });
+        let closed_entity_result: Result<_, ()> = Ok((
+            Deferred::new(Arc::new(Connection(done_tx.clone())), {
+                let tx = retire_tx.clone();
+                move |value| tx.send(value).unwrap()
+            }),
+            Vec::<String>::new(),
+        ));
+        drop(closed_entity_result); // Entity update rejected the initialized result.
+        let window_backend = Some(Deferred::new(Arc::new(Connection(done_tx)), move |value| {
+            retire_tx.send(value).unwrap()
+        }));
+        drop(window_backend); // No active query owns another connection reference.
+        let worker_id = worker.join().unwrap();
+        for _ in 0..2 {
+            let destructor = done_rx.recv().unwrap();
+            assert_eq!(destructor, worker_id);
+            assert_ne!(destructor, std::thread::current().id());
+        }
+    }
+    #[test]
     fn replacement_pending_clear_and_window_drop_finalize_on_worker() {
         struct Probe(std::sync::mpsc::Sender<std::thread::ThreadId>);
         impl Drop for Probe {
