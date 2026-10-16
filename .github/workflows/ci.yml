@@ -73,7 +73,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --target '${{ matrix.target }}' --locked -- -D warnings
       - name: Unit tests (not native UI acceptance)
-        run: cargo test --workspace --target '${{ matrix.target }}' --locked
+        run: cargo test --workspace --no-fail-fast --target '${{ matrix.target }}' --locked
       - name: Native release build
         run: cargo build --workspace --release --target '${{ matrix.target }}' --locked
       - name: Dependency evidence

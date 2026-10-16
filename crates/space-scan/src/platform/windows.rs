@@ -17,10 +17,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO,
-    FILE_LIST_DIRECTORY, FILE_NAME_OPENED, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FileAttributeTagInfo, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdInfo,
-    FileStandardInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, ReOpenFile,
-    VOLUME_NAME_DOS, VOLUME_NAME_GUID,
+    FILE_LIST_DIRECTORY, FILE_NAME_OPENED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdBothDirectoryInfo,
+    FileIdBothDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, ReOpenFile, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
 };
 use windows_sys::Win32::System::SystemServices::{
     IO_REPARSE_TAG_CLOUD, IO_REPARSE_TAG_CLOUD_MASK, IO_REPARSE_TAG_FILE_PLACEHOLDER,
@@ -43,6 +43,8 @@ fn metadata_file(parent: &Dir, name: &OsStr) -> io::Result<std::fs::File> {
         .follow(FollowSymlinks::No);
     // cap-primitives 4.0.3 preserves an explicitly supplied OPEN_REPARSE_POINT
     // with follow(No), opening the reparse object rather than its target.
+    // Its relative CreateFileAtW also supplies FILE_READ_ATTRIBUTES internally;
+    // requesting zero here excludes data access, not that required metadata right.
     parent.open_with(name, &options).map(|file| file.into_std())
 }
 
@@ -78,7 +80,9 @@ pub(crate) fn open_anchor(path: &std::path::Path) -> io::Result<Dir> {
         ));
     }
     let file = std::fs::OpenOptions::new()
-        .access_mode(0)
+        // Unlike cap's relative open, this std open needs an explicit metadata
+        // right for FileAttributeTagInfo. FILE_READ_ATTRIBUTES is not file data.
+        .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(METADATA_OPEN_FLAGS)
         .open(path)?;
@@ -106,18 +110,20 @@ pub(crate) fn entries(dir: &Dir) -> io::Result<Entries> {
     // SAFETY: original owns a live directory handle throughout this synchronous
     // call. ReOpenFile operates on that held object, not its current path. It
     // returns a new owning handle or INVALID_HANDLE_VALUE. These flags request
-    // directory listing only, retain no-delete sharing, and suppress reparse
+    // directory listing and metadata, retain no-delete sharing, and suppress reparse
     // processing. No privilege is enabled and no regular-file data is requested.
     let raw = unsafe {
         ReOpenFile(
             original.as_raw_handle(),
-            FILE_LIST_DIRECTORY,
+            // ReOpenFile replaces the access mask; it does not inherit the
+            // metadata rights needed by our post-open and refill tag checks.
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             METADATA_OPEN_FLAGS,
         )
     };
     if raw == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+        return Err(sdk_error("ReOpenFile(directory listing)"));
     }
     // SAFETY: the successful ReOpenFile result is a new, valid owned handle.
     // Ownership transfers exactly once into OwnedHandle, which closes it on
@@ -171,7 +177,10 @@ impl Entries {
                 self.done = true;
                 return Ok(false);
             }
-            return Err(error);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("GetFileInformationByHandleEx(directory entries): {error}"),
+            ));
         }
         self.restart = false;
         self.next_offset = Some(0);
@@ -454,10 +463,17 @@ fn attribute_info(handle: BorrowedHandle<'_>) -> io::Result<FILE_ATTRIBUTE_TAG_I
         )
     };
     if success == 0 {
-        Err(io::Error::last_os_error())
+        Err(sdk_error(
+            "GetFileInformationByHandleEx(FileAttributeTagInfo)",
+        ))
     } else {
         Ok(info)
     }
+}
+
+fn sdk_error(operation: &str) -> io::Error {
+    let error = io::Error::last_os_error();
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
 
 /// The entire 64-bit volume serial returned with the 128-bit file ID is kept.

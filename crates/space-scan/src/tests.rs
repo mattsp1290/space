@@ -231,7 +231,7 @@ fn selected_root_replacement_is_not_continuity() {
         IdentityValidation::Changed
     );
 }
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn raw_names_and_symlink_cycles_are_preserved_not_followed() {
     use std::os::unix::{ffi::OsStringExt, fs::symlink};
@@ -513,4 +513,26 @@ fn selecting_descendant_of_identity_excluded_root_is_refused() {
     );
     assert!(result.is_err());
     assert!(!emitted);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_unicode_names_and_symlink_cycles_are_preserved_not_followed() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    let name = std::ffi::OsStr::new("文件-MixedCase");
+    fs::write(fixture.0.join(name), b"x").unwrap();
+    symlink(&fixture.0, fixture.0.join("cycle")).unwrap();
+    let (_, records) = fixture.collect(&fixture.spec(), Default::default());
+    assert!(
+        entries(&records)
+            .iter()
+            .any(|entry| entry.name == Some(NativeName::from_os(name).unwrap()))
+    );
+    assert_eq!(entries(&records).len(), 3);
+    assert!(
+        entries(&records)
+            .iter()
+            .any(|entry| entry.kind == EntryKind::Symlink)
+    );
 }

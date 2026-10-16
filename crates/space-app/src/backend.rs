@@ -415,6 +415,26 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        if completed.snapshot.root_entry.logical.observed_bytes != 12 {
+            let spec = lock(&opened.backend)
+                .unwrap()
+                .spec(completed.snapshot.scan)
+                .unwrap();
+            let finish = space_scan::scan(
+                &source,
+                &spec,
+                &Cancellation::new(),
+                space_scan::ScanLimits::default(),
+                |batch| {
+                    eprintln!("Unexpected fixture scan batch: {batch:?}");
+                    Ok(())
+                },
+            );
+            eprintln!(
+                "Unexpected fixture finish: {finish:?}; root: {:?}",
+                completed.snapshot.root_entry
+            );
+        }
         assert_eq!(completed.snapshot.root_entry.logical.observed_bytes, 12);
         let page = query(
             &opened.backend,
