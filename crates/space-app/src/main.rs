@@ -356,7 +356,7 @@ impl Render for Space {
                         uniform_list(
                             "rows",
                             ROW_COUNT,
-                            cx.processor(|this, range, _, cx| {
+                            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                                 range
                                     .map(|ix| {
                                         div()
