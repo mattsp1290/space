@@ -153,6 +153,9 @@ struct Space {
 
 impl Drop for Space {
     fn drop(&mut self) {
+        // Close the queue synchronously; Running::drop dispatches cancellation
+        // off the UI thread, including the publication-guard wait.
+        let _ = self.disks.batch.reduce(scan_batch::Event::Shutdown);
         if let Some(pending) = self.pending_query.take() {
             self.executor
                 .spawn(async move {

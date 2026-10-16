@@ -219,16 +219,6 @@ fn tile_color(label: &str, active: bool) -> u32 {
     PALETTE[hash % PALETTE.len()]
 }
 
-/// Compatibility entry point while callers migrate to available-area sizing.
-pub fn view<T: 'static>(
-    model: &Model,
-    selected: Option<NodeId>,
-    cx: &mut Context<T>,
-    on_event: fn(&mut T, Event, &mut Window, &mut Context<T>),
-) -> Div {
-    view_sized(model, selected, Size::Height(240.), cx, on_event)
-}
-
 /// Normalized geometry scales with the GPUI container without reordering tiles.
 /// The closure captures the caller's complete card/scan/query ticket. The caller
 /// must revalidate it before resolving a NodeId or opening the list alternative.
