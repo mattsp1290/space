@@ -4,6 +4,17 @@
 //! Unsafe code is contained in this platform adapter. SDK queries borrow live handles and
 //! write to initialized, correctly sized output buffers. Directory iteration
 //! reopens the held object with list-directory rights, never an ambient path.
+//!
+//! Hydration boundary: metadata acquisition requests OPEN_NO_RECALL. The
+//! directory-only listing open cannot combine FILE_DIRECTORY_FILE with that
+//! option, so it instead requests OPEN_REPARSE_POINT on the retained object and
+//! rejects reparse/offline/recall tags before and after opening and before each
+//! enumeration batch. Unknown/provider states fail as coverage errors; there is
+//! no content-reading or redirect-following fallback. These checks do not claim
+//! an atomic, empirically verified guarantee against every provider changing its
+//! state concurrently; real cloud-provider behavior remains a native test gap.
+//! SDK contracts: https://learn.microsoft.com/windows/win32/api/winternl/nf-winternl-ntcreatefile
+//! Compatibility: https://sourceware.org/pipermail/cygwin-cvs/2024q2/016360.html
 #![allow(unsafe_code)]
 
 use super::*;
@@ -13,7 +24,15 @@ use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows_sys::Wdk::Storage::FileSystem::{
+    FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    NtCreateFile,
+};
+use windows_sys::Win32::Foundation::{
+    ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, STATUS_SUCCESS,
+    UNICODE_STRING,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
@@ -22,8 +41,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdBothDirectoryInfo,
     FileIdBothDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetDiskFreeSpaceExW,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeNameForVolumeMountPointW,
-    ReOpenFile, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
+    SYNCHRONIZE, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
 };
+use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::SystemServices::{
     IO_REPARSE_TAG_CLOUD, IO_REPARSE_TAG_CLOUD_MASK, IO_REPARSE_TAG_FILE_PLACEHOLDER,
     IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_ONEDRIVE, IO_REPARSE_TAG_STORAGE_SYNC,
@@ -217,28 +237,7 @@ pub(crate) struct Entries {
 pub(crate) fn entries(dir: &Dir) -> io::Result<Entries> {
     let original = dir.try_clone()?.into_std_file();
     let before = require_directory(observation(&original)?)?;
-    // SAFETY: original owns a live directory handle throughout this synchronous
-    // call. ReOpenFile operates on that held object, not its current path. It
-    // returns a new owning handle or INVALID_HANDLE_VALUE. These flags request
-    // directory listing and metadata, retain no-delete sharing, and suppress reparse
-    // processing. No privilege is enabled and no regular-file data is requested.
-    let raw = unsafe {
-        ReOpenFile(
-            original.as_raw_handle(),
-            // ReOpenFile replaces the access mask; it does not inherit the
-            // metadata rights needed by our post-open and refill tag checks.
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            METADATA_OPEN_FLAGS,
-        )
-    };
-    if raw == INVALID_HANDLE_VALUE {
-        return Err(sdk_error("ReOpenFile(directory listing)"));
-    }
-    // SAFETY: the successful ReOpenFile result is a new, valid owned handle.
-    // Ownership transfers exactly once into OwnedHandle, which closes it on
-    // every exit path; original remains separately owned and is not consumed.
-    let file = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(raw) });
+    let file = reopen_directory_for_listing(original.as_handle())?;
     let after = require_directory(observation(&file)?)?;
     if before.identity != after.identity {
         return Err(io::Error::new(
@@ -253,6 +252,72 @@ pub(crate) fn entries(dir: &Dir) -> io::Result<Entries> {
         restart: true,
         done: false,
     })
+}
+
+fn reopen_directory_for_listing(directory: BorrowedHandle<'_>) -> io::Result<std::fs::File> {
+    // Win32 ReOpenFile cannot reopen directories. An empty name relative to the
+    // already-held directory opens that same object with an independent cursor,
+    // without resolving its path or following a substituted ancestor.
+    let mut empty = [0_u16];
+    let name = UNICODE_STRING {
+        Length: 0,
+        MaximumLength: std::mem::size_of_val(&empty) as u16,
+        Buffer: empty.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: directory.as_raw_handle(),
+        ObjectName: &name,
+        ..Default::default()
+    };
+    let mut status_block = IO_STATUS_BLOCK::default();
+    let mut raw = INVALID_HANDLE_VALUE;
+    // SAFETY: directory is borrowed from a live, validated, no-delete-share
+    // directory owner. name, its initialized UTF-16 buffer, attributes, raw, and
+    // status_block all remain valid for this synchronous call. FILE_OPEN cannot
+    // create/overwrite anything. DIRECTORY_FILE excludes regular-file data;
+    // OPEN_REPARSE_POINT suppresses redirection. Only listing, attributes, and
+    // synchronization rights are requested. The new handle is owned below;
+    // no input pointer/handle ownership is transferred or retained after return.
+    // FILE_OPEN_NO_RECALL is deliberately absent: it is incompatible with the
+    // directory-only create option. Placeholder/tag checks surround the open.
+    let status = unsafe {
+        NtCreateFile(
+            &mut raw,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &attributes,
+            &mut status_block,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        // SAFETY: this SDK conversion consumes a scalar NTSTATUS, accepts every
+        // status value, and neither borrows memory nor transfers ownership.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        let error = io::Error::from_raw_os_error(code as i32);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("NtCreateFile(held directory listing), NTSTATUS {status:#010x}: {error}"),
+        ));
+    }
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "NtCreateFile succeeded without returning a valid directory handle",
+        ));
+    }
+    // SAFETY: successful synchronous NtCreateFile returned a new owning handle,
+    // checked against both invalid values. Ownership is transferred once; every
+    // later error closes it through OwnedHandle/File, independent of directory.
+    Ok(std::fs::File::from(unsafe {
+        OwnedHandle::from_raw_handle(raw)
+    }))
 }
 
 impl Entries {
@@ -991,19 +1056,21 @@ mod tests {
 
     #[test]
     fn native_observation_does_not_request_read_access() {
-        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::io::Read as _;
         let fixture = Fixture::new();
         let path = fixture.0.join("locked");
-        let _locked = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .share_mode(0)
-            .open(path)
-            .unwrap();
-        // A data-reading open conflicts with share_mode(0), while a zero-access
-        // metadata open is permitted by Windows sharing rules.
-        assert!(std::fs::File::open(fixture.0.join("locked")).is_err());
-        assert!(observe(&fixture.dir(), OsStr::new("locked")).is_ok());
+        std::fs::write(path, b"fixture contents").unwrap();
+        let root = fixture.dir();
+        let mut metadata = metadata_file(&root, OsStr::new("locked")).unwrap();
+        assert!(observation(&metadata).is_ok());
+        // Check the actual scanner handle rather than relying on an assumption
+        // about metadata opens sharing with an exclusive data handle.
+        let mut buffer = [0_u8; 1];
+        assert_eq!(
+            metadata.read(&mut buffer).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(buffer, [0]);
     }
 
     #[test]

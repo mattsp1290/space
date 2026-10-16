@@ -194,86 +194,6 @@ fn chart_folder(model: &treemap::Model, node: NodeId) -> Option<String> {
         .find(|item| item.node == node && item.is_directory)
         .map(|item| item.label.clone())
 }
-#[cfg(test)]
-mod presentation_tests {
-    use super::*;
-    #[test]
-    fn stale_alias_click_cannot_target_another_scan_or_selection() {
-        let node = NodeId::try_from(1).unwrap();
-        let a = space_core::ScanId::try_from(1).unwrap();
-        let b = space_core::ScanId::try_from(2).unwrap();
-        let rows = [(node, "alias".into())];
-        assert!(alias_selection_is_current(
-            (1, Some(a)),
-            (1, Some(a)),
-            node,
-            &rows
-        ));
-        assert!(!alias_selection_is_current(
-            (1, Some(a)),
-            (2, Some(a)),
-            node,
-            &rows
-        ));
-        assert!(!alias_selection_is_current(
-            (1, Some(a)),
-            (1, Some(b)),
-            node,
-            &rows
-        ));
-        assert!(!alias_selection_is_current(
-            (1, Some(a)),
-            (1, Some(a)),
-            node,
-            &[]
-        ));
-    }
-
-    #[test]
-    fn empty_reload_clears_applied_counts_pages_and_selection() {
-        let mut next = Some(PageCursor {
-            ordinal: 42,
-            value: 100,
-        });
-        let mut selected = 9;
-        let mut filter = space_store::QueryFilter {
-            name: Some("old".into()),
-            ..Default::default()
-        };
-        let mut status = "Filtered: 99 matches, 12345 bytes".into();
-        reset_empty_presentation(&mut next, &mut selected, &mut filter, &mut status);
-        assert!(next.is_none());
-        assert_eq!(selected, 0);
-        assert!(filter.is_empty());
-        assert_eq!(status, "No cached scan is displayed.");
-    }
-    #[test]
-    fn old_sibling_chart_event_is_rejected_while_next_scope_loads() {
-        let a = NodeId::try_from(1).unwrap();
-        let b = NodeId::try_from(2).unwrap();
-        let mut model = treemap::Model {
-            items: [(a, "A"), (b, "B")]
-                .into_iter()
-                .map(|(node, label)| treemap::Item {
-                    node,
-                    label: label.into(),
-                    detail: String::new(),
-                    bytes: 1,
-                    unknown_count: 0,
-                    is_directory: true,
-                })
-                .collect(),
-            ..Default::default()
-        };
-        assert_eq!(chart_folder(&model, a).as_deref(), Some("A"));
-        let mut selected = Some(a);
-        clear_chart(&mut model, &mut selected);
-        assert!(chart_folder(&model, b).is_none());
-        assert!(model.items.is_empty());
-        assert!(selected.is_none());
-    }
-}
-
 fn control(id: &'static str, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
@@ -654,7 +574,7 @@ impl Space {
             let filtered=this.filter_session.take();
             this.rows.clear();this.row_paths.clear();this.clear_aliases();this.breadcrumbs.clear();clear_chart(&mut this.treemap,&mut this.chart_selected);this.current_totals=None;
             let task=cx.background_executor().spawn(async move {
-                if let Some((_,query))=pending_query {if let Some(filtered)=query.filtered{filtered.close_on_worker();}}
+                if let Some((_,query))=pending_query && let Some(filtered)=query.filtered{filtered.close_on_worker();}
                 drop(snapshot);drop(pending);if let Some(filtered)=filtered{filtered.close_on_worker();}
                 let outcome=backend::remove_cached(&backend,scan);
                 let reloaded=backend::reload(&backend);
@@ -1377,7 +1297,7 @@ impl Render for Space {
                 .child(control("cancel","Cancel (Esc)").on_click(cx.listener(|t,_,w,cx|t.cancel(&Cancel,w,cx))))
                 .child(control("cache","Cache / diagnostics").on_click(cx.listener(|t,_,w,cx|t.show_cache(&ShowCache,w,cx))))
                 .child(control("saved","Next saved root").on_click(cx.listener(|t,_,w,cx|t.next_saved(&NextSavedRoot,w,cx)))))
-            .child(control("volume-toggle","Show / hide mounted targets").on_click(cx.listener(|t,_,_,cx|{t.volumes_visible=!t.volumes_visible;cx.notify();})))
+            .child(control("volume-toggle","Show / hide mounted targets").on_click(cx.listener(|t,_,_,cx|{t.volumes_visible = !t.volumes_visible;cx.notify();})))
             .when(self.volumes_visible,|e|e.child(div().flex().gap_2().child(control("volume-refresh","Refresh mounted targets").on_click(cx.listener(|t,_,w,cx|t.refresh_volumes(&RefreshVolumes,w,cx))))
                 .child(control("volume-next","Next targets page").on_click(cx.listener(|t,_,w,cx|t.next_volumes(&NextVolumes,w,cx)))))
             .child(if self.volume_busy {"Reading OS mount metadata…"}else{"Mounted targets: choose one, then explicitly Scan. Capacity is OS available space, separate from scan totals."})
@@ -1490,4 +1410,84 @@ fn main() {
         }
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    #[test]
+    fn stale_alias_click_cannot_target_another_scan_or_selection() {
+        let node = NodeId::try_from(1).unwrap();
+        let a = space_core::ScanId::try_from(1).unwrap();
+        let b = space_core::ScanId::try_from(2).unwrap();
+        let rows = [(node, "alias".into())];
+        assert!(alias_selection_is_current(
+            (1, Some(a)),
+            (1, Some(a)),
+            node,
+            &rows
+        ));
+        assert!(!alias_selection_is_current(
+            (1, Some(a)),
+            (2, Some(a)),
+            node,
+            &rows
+        ));
+        assert!(!alias_selection_is_current(
+            (1, Some(a)),
+            (1, Some(b)),
+            node,
+            &rows
+        ));
+        assert!(!alias_selection_is_current(
+            (1, Some(a)),
+            (1, Some(a)),
+            node,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn empty_reload_clears_applied_counts_pages_and_selection() {
+        let mut next = Some(PageCursor {
+            ordinal: 42,
+            value: 100,
+        });
+        let mut selected = 9;
+        let mut filter = space_store::QueryFilter {
+            name: Some("old".into()),
+            ..Default::default()
+        };
+        let mut status = "Filtered: 99 matches, 12345 bytes".into();
+        reset_empty_presentation(&mut next, &mut selected, &mut filter, &mut status);
+        assert!(next.is_none());
+        assert_eq!(selected, 0);
+        assert!(filter.is_empty());
+        assert_eq!(status, "No cached scan is displayed.");
+    }
+    #[test]
+    fn old_sibling_chart_event_is_rejected_while_next_scope_loads() {
+        let a = NodeId::try_from(1).unwrap();
+        let b = NodeId::try_from(2).unwrap();
+        let mut model = treemap::Model {
+            items: [(a, "A"), (b, "B")]
+                .into_iter()
+                .map(|(node, label)| treemap::Item {
+                    node,
+                    label: label.into(),
+                    detail: String::new(),
+                    bytes: 1,
+                    unknown_count: 0,
+                    is_directory: true,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(chart_folder(&model, a).as_deref(), Some("A"));
+        let mut selected = Some(a);
+        clear_chart(&mut model, &mut selected);
+        assert!(chart_folder(&model, b).is_none());
+        assert!(model.items.is_empty());
+        assert!(selected.is_none());
+    }
 }

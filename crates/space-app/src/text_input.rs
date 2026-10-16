@@ -1032,7 +1032,7 @@ mod tests {
         assert_eq!(utf16_to_byte(&state.content, 2), 5);
         assert_eq!(clamp_byte_boundary(&state.content, 3), 1);
         assert_eq!(clamp_byte_boundary(&state.content, 99), 8);
-        assert_eq!(state.byte_range(&(99..1)), 1..8);
+        assert_eq!(state.byte_range(&Range { start: 99, end: 1 }), 1..8);
         assert_eq!(state.byte_range(&(99..100)), 8..8);
     }
     #[test]
@@ -1066,7 +1066,7 @@ mod tests {
     fn cancelled_composition_and_single_line_paste_are_safe() {
         let mut state = EditState::default();
         state.replace(None, "test", None, false);
-        state.replace(None, "候補", Some(99..0), true);
+        state.replace(None, "候補", Some(Range { start: 99, end: 0 }), true);
         state.replace(None, "", Some(0..0), true);
         state.finish_composition();
         assert_eq!(state.content, "test");
