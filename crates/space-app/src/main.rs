@@ -409,13 +409,13 @@ impl Space {
         cx.notify();
     }
     fn open_row(&mut self, _: &OpenRow, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get(self.selected) {
-            if row.entry.kind == EntryKind::Directory {
-                self.breadcrumbs
-                    .push((row.entry.node, row.entry.display_name.clone()));
-                self.view = View::Folders;
-                self.request_query(None, cx);
-            }
+        if let Some(row) = self.rows.get(self.selected)
+            && row.entry.kind == EntryKind::Directory
+        {
+            self.breadcrumbs
+                .push((row.entry.node, row.entry.display_name.clone()));
+            self.view = View::Folders;
+            self.request_query(None, cx);
         }
     }
     fn up(&mut self, _: &GoUp, _: &mut Window, cx: &mut Context<Self>) {

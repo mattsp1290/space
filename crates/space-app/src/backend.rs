@@ -103,13 +103,12 @@ pub fn open(directory: &Path) -> Result<Opened> {
     let roots = published_roots(&reader)?;
     let mut latest = None;
     for root in &roots {
-        if let Some(scan) = cache.latest(root.id).map_err(error)? {
-            if latest
+        if let Some(scan) = cache.latest(root.id).map_err(error)?
+            && latest
                 .as_ref()
                 .is_none_or(|(_, previous): &(RootRecord, ScanId)| scan > *previous)
-            {
-                latest = Some((root.clone(), scan));
-            }
+        {
+            latest = Some((root.clone(), scan));
         }
     }
     let snapshot = latest
