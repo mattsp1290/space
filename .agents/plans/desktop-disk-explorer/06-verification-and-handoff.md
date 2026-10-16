@@ -1,0 +1,21 @@
+# Execution handoff
+Planning deliverable only. Read all numbered files before implementation; verify repository baseline and any intervening changes. Do not overwrite unrelated work. User has requested a plan, not application implementation or remote publication.
+
+## Ordered work packages
+1. G0 / WP1 native feasibility and bootstrap: new workspace, pinned dependencies/toolchain, new docs/platform-support.md, docs/dependencies.md, docs/development.md, CI and package spike. Gate: actual native window/text/picker/keyboard/reveal on Windows/macOS/Linux with chosen architectures and Linux X11+Wayland. Resolve license inventory and platform constraints before feature work.
+2. WP2 domain and scanner: new space-core and space-scan modules. Gate: tested policy/coverage/path/identity/size contracts and bounded cancellable traversal on all OSes. UI-independent fixtures and real metadata checks required.
+3. WP3 persistence/query: new space-store schema, writer and recovery. Can overlap WP2 after domain contracts freeze; integration waits for both. Gate: exclusive-cache concurrent-launch and process-kill/disk-full/corruption tests, published snapshot atomicity, offline browse and 1M-entry benchmark.
+4. WP4 usable desktop: new space-app target picker/progress/hierarchy/largest-files/filters/details/actions. Gate: end-to-end native scan -> browse -> quit -> offline reopen, with query/scan cancellation race tests and keyboard/screen-reader checks.
+5. WP5 treemap and first complete release: new treemap component, packaging polish and documentation. Gate: same scope/metric totals as lists, bounded layout, empty/unknown states, verified packages and performance targets. User credentials/signing approvals are external release prerequisites; record missing native validation as blocked, never passing.
+6. WP6 Changes: proposed comparison module and UI mode after WP5. Gate: baseline identity/policy validation and coverage-aware comparison fixtures; no false deletion or hardlink-driven growth claims.
+
+## Test layers and proposed commands
+Once bootstrap defines the workspace: cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo test --workspace --locked; cargo build --workspace --release --locked. Per-crate tests must isolate scanner/store from the GPU. Add a deterministic fixture/benchmark command in the actual workspace at WP2, document its real invocation rather than relying on an invented existing CLI. CI stores benchmark environment, input seed, counts, cold/warm distinction, times, RAM and cache size. Baselines should use synthetic metadata for query scale plus a real enumerated filesystem fixture for scanner behavior.
+
+Native platform jobs test platform-specific metadata. Real permission-denial tests run as non-admin/non-root. Test Unix non-UTF-8 and Windows UTF-16/long paths. Allocated-size checks distinguish sparse/compressed/unknown states. Keep cloud-placeholder tests explicitly manual/integration where hosted CI lacks providers; a skipped test cannot prove no hydration. Check blocked OS call cancellation without promising forcibly interruptible filesystem APIs.
+
+## Recovery and release
+No existing user migration or flags. Once shipped, version caches and test upgrades. Build failures stop release; package rollback returns to prior binary with a readable cache version or retained backup, never auto-wipes newer data. Future incompatible schema changes require export/retention/recovery policy even though today's repository has no consumers. Never sign/publish without user-authorized release credentials/actions.
+
+## Definition of done
+All requested platforms tested with their real packaged UI, correctness fixtures pass, offline cached browsing confirmed, bounded memory/performance recorded, three linked views and filters verified, error/privacy states documented, licenses resolved, and no unreviewed feature scope. First complete release is WP5; approved follow-on comparison is WP6. Report first-release and follow-on completion separately. No duplicate detector, delete capability, background service, network account integration, privileged MFT scan, or universal reclaimable-byte claim.

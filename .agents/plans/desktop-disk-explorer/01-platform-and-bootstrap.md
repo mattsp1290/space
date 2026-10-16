@@ -1,0 +1,16 @@
+# Platform and bootstrap
+## G0: prove the native application boundary
+Prerequisite: existing root README.md, LICENSE and .gitignore. No implementation exists. Create new root Cargo.toml, Cargo.lock, rust-toolchain.toml and crates/ with the four crates named in the overview. New symbols and modules are implementation proposals; select idiomatic concrete names during bootstrap.
+
+Before substantial scanner/UI implementation, pin a mutually compatible GPUI + gpui_platform release or immutable Git revision and Rust compiler. Verify the pinned platform feature set; upstream main currently documents macOS font-kit for glyph rasterization, Linux wayland/x11, and Windows native Win32/DirectWrite. Do not assume examples from a different revision compile. Record pin, compiler, licenses and minimum supported OS/GPU/runtime baselines in new docs/platform-support.md and docs/dependencies.md.
+
+Build a small native window with text, a virtualized list, keyboard focus, folder selection, background progress, clipboard and reveal action on each OS. Test HiDPI, screen-reader label/focus behavior, resize, shutdown while background work runs, and startup on an unsupported renderer. Record unsupported accessibility capabilities as a release blocker to resolve or a limitation requiring explicit scope acceptance, not as a pass. Do not import Zed's full application or GPL UI solely for convenient controls.
+
+Packaging spike: produce a macOS .app archive, Windows portable zip, Linux tar archive on a declared distro/libc baseline. Install/open on machines without a developer checkout. Release pipeline should support macOS signing/notarization and Windows signing when credentials are supplied; never invent certificates or claim unsigned binaries are signed. A signed/notarized macOS release is a release gate. Windows portable delivery is acceptable with clearly documented signing status and installation constraints. A native installer/AppImage may follow if justified. Linux X11 and Wayland are both in the acceptance matrix.
+
+If any advertised OS cannot open the UI or perform folder selection, stop at G0. Report exact dependency/backend blocker and proposed resolution; do not quietly drop an OS or switch frameworks.
+
+## Build and licensing
+New .github/workflows/ci.yml: platform build/test matrix and locked dependencies, formatting, Clippy. This project's three-platform requirement takes precedence over unrelated prior repos' Linux-only CI preferences. Native UI tests cannot be replaced by headless Cargo tests. New docs/development.md defines exact commands and prerequisites verified at this pin. Proposed baseline commands after workspace exists: cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo test --workspace --locked; cargo build --workspace --release --locked. Adapt target-specific features only when documented, never invent a passing command.
+
+Run dependency and asset license inventory. If selecting GPL component: document compatible license version and obligations, update existing LICENSE and README.md plus third-party notices in the same implementation change; GPL permission is established but actual compatibility must be verified. Keep MIT if dependencies permit it. No publishing, release, signing-account creation or credential changes are implied by planning.

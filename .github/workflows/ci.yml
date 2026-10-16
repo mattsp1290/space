@@ -1,0 +1,124 @@
+name: Native bootstrap CI
+on:
+  pull_request:
+  push:
+    branches: [main, 'feat/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev cmake pkg-config \
+            libfontconfig1-dev libfreetype6-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev libvulkan1 \
+            libssl-dev libzstd-dev libglib2.0-dev
+      - name: Inspect native build toolchain
+        run: |
+          uname -a
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            xcodebuild -version
+            xcrun --find metal
+            xcrun --find metallib
+          fi
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            ldd --version
+            pkg-config --modversion fontconfig freetype2 wayland-client xkbcommon xkbcommon-x11
+          fi
+      - name: Inspect Windows shader compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/bin/*/x64/fxc.exe' |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for release shaders.' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --target '${{ matrix.target }}'
+          rustc -Vv
+          cargo -V
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --target '${{ matrix.target }}' --locked -- -D warnings
+      - name: Unit tests (not native UI acceptance)
+        run: cargo test --workspace --target '${{ matrix.target }}' --locked
+      - name: Native release build
+        run: cargo build --workspace --release --target '${{ matrix.target }}' --locked
+      - name: Dependency evidence
+        run: |
+          cargo metadata --format-version 1 --locked --filter-platform '${{ matrix.target }}' > target/dependency-metadata.json
+          ${{ runner.os == 'Windows' && 'python' || 'python3' }} scripts/dependency-inventory.py target/dependency-metadata.json 'target/dependency-inventory-${{ matrix.target }}.json'
+          cargo tree --locked --target '${{ matrix.target }}' -e features > target/dependency-features.txt
+      - name: Package Linux or macOS development build
+        if: runner.os != 'Windows'
+        run: bash scripts/package.sh '${{ matrix.target }}'
+      - name: Package Windows development build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Target '${{ matrix.target }}'
+      - name: Smoke extracted Linux archive
+        if: runner.os == 'Linux'
+        run: |
+          temp=$(mktemp -d)
+          tar -xzf 'dist/space-${{ matrix.target }}-g0.tar.gz' -C "$temp"
+          cd "$temp"
+          './space-${{ matrix.target }}-g0/bin/space' --version
+      - name: Smoke extracted macOS archive
+        if: runner.os == 'macOS'
+        run: |
+          temp=$(mktemp -d)
+          ditto -x -k 'dist/space-${{ matrix.target }}-g0.zip' "$temp"
+          cd "$temp"
+          './space-${{ matrix.target }}-g0/Space.app/Contents/MacOS/space' --version
+      - name: Smoke extracted Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $temp = Join-Path $env:RUNNER_TEMP ([guid]::NewGuid().ToString())
+          Expand-Archive 'dist/space-${{ matrix.target }}-g0.zip' $temp
+          Set-Location $temp
+          & './space-${{ matrix.target }}-g0/space.exe' --version
+          if ($LASTEXITCODE -ne 0) { throw 'Extracted binary version smoke failed.' }
+      # Distribution gate: no executable/archive upload until third-party license
+      # and NOTICE texts are assembled and reviewed. Packaging is ephemeral CI only.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: space-${{ matrix.target }}-g0-evidence
+          path: |
+            target/package-evidence-${{ matrix.target }}/*
+            target/dependency-inventory-*.json
+            target/dependency-features.txt
+          if-no-files-found: error
+          retention-days: 14
