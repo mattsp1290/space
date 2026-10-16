@@ -71,3 +71,12 @@ Before release:
 The upstream Linux script installs dependencies for the entire editor. Space's CI
 uses a narrower candidate set and must validate it in an actual build. Do not run
 upstream provisioning scripts blindly or inherit unrelated server/database needs.
+
+## Dashboard regression harness
+
+The app's development dependency enables GPUI `test-support` at the same immutable
+revision. This adds upstream test-only helpers (including the upstream pinned
+proptest Git revision) to `Cargo.lock`, so real controller callbacks can be tested
+with GPUI's in-process test platform. Release dependencies and the GPUI revision
+are unchanged. Dependency inventories include these development dependencies;
+license clearance and executable-distribution gates remain unchanged.

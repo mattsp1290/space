@@ -19,5 +19,8 @@ space-store = { path = "../space-store" }
 gpui.workspace = true
 gpui_platform.workspace = true
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

@@ -147,6 +147,44 @@ pub fn open_root(backend: &Backend, root: RootRecord) -> Result<Snapshot> {
         .ok_or("This saved root has no published scan.")?;
     snapshot(&cache, root, scan)
 }
+/// Reopen the exact immutable publication the card displayed, even if another
+/// scan has since become latest. Never substitute another root or generation.
+pub fn open_scan(backend: &Backend, root: RootRecord, scan: ScanId) -> Result<Snapshot> {
+    let cache = read(backend)?;
+    let spec = cache.spec(scan).map_err(error)?;
+    if spec.root_id != root.id
+        || spec.lineage_id != root.lineage
+        || spec.expected_root != root.identity
+    {
+        return Err("This scan does not belong to the selected saved root.".into());
+    }
+    let root = cache.root(root.id).map_err(error)?;
+    snapshot(&cache, root, scan)
+}
+
+/// Metadata-only target discovery plus saved published roots. This service does
+/// not enumerate source contents and must run on a background worker.
+pub fn discovery(backend: &Backend) -> Result<(space_scan::VolumeListing, Vec<RootRecord>)> {
+    let listing = space_scan::enumerate_volumes().map_err(error)?;
+    let cache = read(backend)?;
+    let roots = published_roots(&cache)?;
+    Ok((listing, roots))
+}
+
+/// Bounded cached child totals for an independently normalized dashboard map.
+/// Use the explorer page budget so every visible tile can be selected immediately;
+/// remaining child weight is represented by Other.
+pub fn preview(backend: &Backend, snapshot: &Snapshot, metric: Metric) -> Result<ChildrenSummary> {
+    read(backend)?
+        .children_summary(
+            snapshot.scan,
+            snapshot.root_entry.entry.node,
+            metric,
+            PAGE_SIZE,
+        )
+        .map_err(error)
+}
+
 pub struct Filtered {
     pub view: Mutex<FilteredView>,
     pub root: StoredEntry,
@@ -290,6 +328,8 @@ pub fn aliases(
 pub struct ScanRequest {
     pub path: PathBuf,
     pub cache_directory: PathBuf,
+    /// Identity observed at selection or discovery, including a first scan.
+    pub expected_root: Option<RootIdentity>,
     /// Present for refresh; identity mismatch must require explicit new selection.
     pub refresh_root: Option<RootRecord>,
     pub generation: u64,
@@ -315,7 +355,18 @@ pub fn scan(
     cancel: &Cancellation,
     progress: &Progress,
 ) -> Result<Option<Completed>> {
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
     let observed = space_scan::inspect_root(&request.path).map_err(error)?;
+    // Validate before begin(): a queued, never-scanned mount can be replaced at
+    // the same path while another disk is running. The scanner validates again
+    // against this observation before traversal to close the later race.
+    if request.expected_root.as_ref().is_some_and(|expected| {
+        expected.validate_against(&observed) != IdentityValidation::MatchingObservation
+    }) {
+        return Err("The selected root changed or cannot be verified. Discover disks or choose the folder again before scanning.".into());
+    }
     let mut policy = crate::paths::scan_policy(&request.path, &request.cache_directory)?;
     // OS identity is authoritative even if casing or another native alias differs.
     let cache_identity = space_scan::inspect_root(&request.cache_directory).map_err(error)?;
@@ -343,9 +394,7 @@ pub fn scan(
             Some(root)
         } else {
             cache.roots().map_err(error)?.into_iter().find(|root| {
-                root.path == NativePath::from_path(&request.path)
-                    && root.identity.validate_against(&observed)
-                        == IdentityValidation::MatchingObservation
+                root.identity.validate_against(&observed) == IdentityValidation::MatchingObservation
             })
         };
         let (root_id, lineage_id) = match matching {
@@ -586,6 +635,7 @@ mod tests {
             ScanRequest {
                 path: source.clone(),
                 cache_directory: directory.clone(),
+                expected_root: None,
                 refresh_root: None,
                 generation: 1,
             },
@@ -603,6 +653,7 @@ mod tests {
             ScanRequest {
                 path: source.clone(),
                 cache_directory: directory,
+                expected_root: None,
                 refresh_root: Some(first.snapshot.root.clone()),
                 generation: 2,
             },
@@ -741,6 +792,7 @@ mod tests {
             ScanRequest {
                 path,
                 cache_directory: directory,
+                expected_root: None,
                 refresh_root: None,
                 generation: 1,
             },
@@ -830,6 +882,7 @@ mod tests {
             ScanRequest {
                 path: path.clone(),
                 cache_directory: directory,
+                expected_root: None,
                 refresh_root: None,
                 generation: 1,
             },
@@ -889,6 +942,7 @@ mod tests {
                     ScanRequest {
                         path,
                         cache_directory: directory.clone(),
+                        expected_root: None,
                         refresh_root: None,
                         generation: 1,
                     },
@@ -923,6 +977,7 @@ mod tests {
             ScanRequest {
                 path: source.clone(),
                 cache_directory: directory.clone(),
+                expected_root: None,
                 refresh_root: None,
                 generation: 1,
             },
@@ -1003,6 +1058,7 @@ mod tests {
             ScanRequest {
                 path: source.clone(),
                 cache_directory: directory.clone(),
+                expected_root: None,
                 refresh_root: None,
                 generation: 1,
             },
@@ -1019,6 +1075,7 @@ mod tests {
                 ScanRequest {
                     path: source.clone(),
                     cache_directory: directory.clone(),
+                    expected_root: None,
                     refresh_root: Some(completed.snapshot.root.clone()),
                     generation: 2
                 },
@@ -1036,6 +1093,7 @@ mod tests {
                 ScanRequest {
                     path: source,
                     cache_directory: directory,
+                    expected_root: None,
                     refresh_root: Some(completed.snapshot.root.clone()),
                     generation: 3
                 },
@@ -1050,6 +1108,367 @@ mod tests {
                 .latest(completed.snapshot.root.id)
                 .unwrap(),
             Some(completed.snapshot.scan)
+        );
+    }
+    fn guarded_request(source: &Path, cache: &Path, generation: u64) -> ScanRequest {
+        ScanRequest {
+            path: source.to_owned(),
+            cache_directory: cache.to_owned(),
+            expected_root: Some(space_scan::inspect_root(source).unwrap()),
+            refresh_root: None,
+            generation,
+        }
+    }
+
+    #[test]
+    fn first_scan_replacement_is_rejected_before_creating_any_cache_record() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let directory = fixture.0.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("original"), b"keep").unwrap();
+        let opened = open(&directory).unwrap();
+        let request = guarded_request(&source, &directory, 1);
+        std::fs::rename(&source, fixture.0.join("disconnected")).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("replacement"), b"other").unwrap();
+        assert!(
+            scan(
+                &opened.backend,
+                request,
+                &Cancellation::new(),
+                &Progress::default()
+            )
+            .is_err()
+        );
+        let cache = lock(&opened.backend).unwrap();
+        assert!(cache.roots().unwrap().is_empty());
+        assert!(cache.scans(None, 100).unwrap().scans.is_empty());
+        assert_eq!(std::fs::read(source.join("replacement")).unwrap(), b"other");
+        assert_eq!(
+            std::fs::read(fixture.0.join("disconnected/original")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn one_scan_all_action_publishes_two_independent_bounded_maps_and_exact_offline_views() {
+        use crate::disk_model::DiskRegistry;
+        use crate::scan_batch::{Effect, Event, ScanBatch, ScanOutcome};
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("cache");
+        let mut volumes = Vec::new();
+        for (name, contents) in [("alpha", "123"), ("beta", "1234567")] {
+            let source = fixture.0.join(name);
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join(format!("{name}.txt")), contents).unwrap();
+            volumes.push(space_scan::MountedVolume {
+                label: "Same display label".into(),
+                mount_path: NativePath::from_path(&source),
+                aliases: vec![],
+                identity: space_scan::inspect_root(&source).unwrap(),
+                filesystem: "fixture".into(),
+                removable: None,
+                capacity: None,
+            });
+        }
+        let listing = space_scan::VolumeListing {
+            observed_at: timestamp().unwrap(),
+            volumes,
+            issues: vec![],
+            complete: true,
+        };
+        let mut registry = DiskRegistry::default();
+        registry.reconcile(&listing, &[]);
+        let opened = open(&directory).unwrap();
+        let mut coordinator = ScanBatch::default();
+        let discover = coordinator.reduce(Event::ScanAll);
+        let [Effect::Discover { batch }] = discover.as_slice() else {
+            panic!("discover")
+        };
+        let mut effects = coordinator.reduce(Event::Discovered {
+            batch: *batch,
+            targets: registry.mounted_targets(),
+        });
+        let mut snapshots = std::collections::BTreeMap::new();
+        let mut maps = std::collections::BTreeMap::new();
+        while let [Effect::Start { token, target }] = effects.as_slice() {
+            let token = *token;
+            let result = scan(
+                &opened.backend,
+                ScanRequest {
+                    path: target.path.to_path_buf().unwrap(),
+                    cache_directory: directory.clone(),
+                    expected_root: Some(target.expected_root.clone()),
+                    refresh_root: target.refresh_root.clone(),
+                    generation: token.request.0,
+                },
+                &Cancellation::new(),
+                &Progress::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.snapshot.root.identity, target.expected_root);
+            assert!(coordinator.accepts(token));
+            let map = preview(&opened.backend, &result.snapshot, Metric::Logical).unwrap();
+            assert_eq!(map.page.entries.len(), 1);
+            maps.insert(
+                token.card_id,
+                (
+                    map.page.entries[0].entry.display_name.clone(),
+                    map.total_bytes,
+                ),
+            );
+            let scan = result.snapshot.scan;
+            registry.reconcile(&listing, &result.roots);
+            snapshots.insert(token.card_id, result.snapshot);
+            effects = coordinator.reduce(Event::Finished {
+                token,
+                outcome: ScanOutcome::Published {
+                    scan,
+                    partial: false,
+                },
+            });
+        }
+        assert!(!coordinator.is_busy());
+        assert_eq!(snapshots.len(), 2);
+        let cards = registry.cards();
+        assert_eq!(maps[&cards[0].id], ("alpha.txt".into(), 3));
+        assert_eq!(maps[&cards[1].id], ("beta.txt".into(), 7));
+        let first = &snapshots[&cards[0].id];
+        let second = &snapshots[&cards[1].id];
+        assert_ne!(first.scan, second.scan);
+        assert!(open_scan(&opened.backend, first.root.clone(), second.scan).is_err());
+        // Offline browsing reads only this immutable cached publication.
+        std::fs::rename(
+            fixture.0.join("alpha"),
+            fixture.0.join("alpha-disconnected"),
+        )
+        .unwrap();
+        let offline = open_scan(&opened.backend, first.root.clone(), first.scan).unwrap();
+        assert_eq!(
+            preview(&opened.backend, &offline, Metric::Logical)
+                .unwrap()
+                .total_bytes,
+            3
+        );
+        assert!(
+            validated_reveal_path(&opened.backend, &offline, offline.root_entry.entry.node)
+                .is_err()
+        );
+        let scan = first.scan;
+        drop(snapshots);
+        assert!(remove_cached(&opened.backend, Some(scan)).is_err());
+        let root = offline.root.clone();
+        drop(offline);
+        remove_cached(&opened.backend, Some(scan)).unwrap();
+        assert!(open_scan(&opened.backend, root, scan).is_err());
+        assert_eq!(
+            std::fs::read(fixture.0.join("alpha-disconnected/alpha.txt")).unwrap(),
+            b"123"
+        );
+        assert_eq!(
+            std::fs::read(fixture.0.join("beta/beta.txt")).unwrap(),
+            b"1234567"
+        );
+    }
+
+    #[test]
+    fn preview_keeps_other_totals_and_exact_reopen_does_not_follow_latest() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let directory = fixture.0.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        for index in 0..150 {
+            std::fs::write(source.join(format!("file-{index:03}")), b"x").unwrap();
+        }
+        let opened = open(&directory).unwrap();
+        let first = scan(
+            &opened.backend,
+            guarded_request(&source, &directory, 1),
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let map = preview(&opened.backend, &first.snapshot, Metric::Logical).unwrap();
+        assert_eq!(map.page.entries.len(), PAGE_SIZE);
+        assert_eq!(map.total_count, 150);
+        assert_eq!(map.total_bytes, 150);
+        assert_eq!(map.other_count, 150 - PAGE_SIZE as u64);
+        assert_eq!(map.other_bytes, 150 - PAGE_SIZE as u64);
+        std::fs::write(source.join("new"), b"1234").unwrap();
+        let second = scan(
+            &opened.backend,
+            guarded_request(&source, &directory, 2),
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let exact = open_scan(
+            &opened.backend,
+            first.snapshot.root.clone(),
+            first.snapshot.scan,
+        )
+        .unwrap();
+        assert_eq!(
+            preview(&opened.backend, &exact, Metric::Logical)
+                .unwrap()
+                .total_bytes,
+            150
+        );
+        assert_eq!(
+            preview(&opened.backend, &second.snapshot, Metric::Logical)
+                .unwrap()
+                .total_bytes,
+            154
+        );
+    }
+
+    #[test]
+    fn observed_native_alias_reuses_root_but_same_volume_nested_folder_does_not() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let nested = source.join("nested");
+        let directory = fixture.0.join("cache");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("file"), b"keep").unwrap();
+        let opened = open(&directory).unwrap();
+        let first = scan(
+            &opened.backend,
+            guarded_request(&source, &directory, 1),
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let alias = scan(
+            &opened.backend,
+            guarded_request(&source.join("."), &directory, 2),
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.snapshot.root.id, alias.snapshot.root.id);
+        let child = scan(
+            &opened.backend,
+            guarded_request(&nested, &directory, 3),
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(first.snapshot.root.id, child.snapshot.root.id);
+        assert_eq!(child.roots.len(), 2);
+    }
+    #[test]
+    fn batch_replacement_failure_advances_then_stop_preserves_published_scans_and_skips_queue() {
+        use crate::disk_model::{CardId, ScanTarget};
+        use crate::scan_batch::{Effect, Event, ScanBatch, ScanOutcome};
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("cache");
+        let opened = open(&directory).unwrap();
+        let mut targets = Vec::new();
+        for id in 1..=4 {
+            let path = fixture.0.join(format!("disk-{id}"));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("kept"), b"123").unwrap();
+            targets.push(ScanTarget {
+                card_id: CardId(id),
+                expected_root: space_scan::inspect_root(&path).unwrap(),
+                path: NativePath::from_path(&path),
+                refresh_root: None,
+            });
+        }
+        let prior = scan(
+            &opened.backend,
+            guarded_request(&fixture.0.join("disk-1"), &directory, 1),
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        targets[0].refresh_root = Some(prior.snapshot.root.clone());
+        let mut batch = ScanBatch::default();
+        let mut effects = batch.reduce(Event::ScanTargets(targets));
+        // Replacement happens after membership was frozen and before the worker
+        // begins, including the first-scan case guarded in the separate test.
+        std::fs::rename(fixture.0.join("disk-1"), fixture.0.join("old-disk-1")).unwrap();
+        std::fs::create_dir(fixture.0.join("disk-1")).unwrap();
+        let execute = |effect: &Effect, cancel: &Cancellation| {
+            let Effect::Start { token, target } = effect else {
+                panic!("start")
+            };
+            scan(
+                &opened.backend,
+                ScanRequest {
+                    path: target.path.to_path_buf().unwrap(),
+                    cache_directory: directory.clone(),
+                    expected_root: Some(target.expected_root.clone()),
+                    refresh_root: target.refresh_root.clone(),
+                    generation: token.request.0,
+                },
+                cancel,
+                &Progress::default(),
+            )
+        };
+        let token = batch.active().unwrap().token;
+        let failure = execute(&effects[0], &Cancellation::new()).err().unwrap();
+        effects = batch.reduce(Event::Finished {
+            token,
+            outcome: ScanOutcome::Failed(failure),
+        });
+        assert_eq!(batch.active().unwrap().token.card_id, CardId(2));
+        let success = execute(&effects[0], &Cancellation::new()).unwrap().unwrap();
+        assert_eq!(
+            preview(&opened.backend, &success.snapshot, Metric::Logical)
+                .unwrap()
+                .total_bytes,
+            3
+        );
+        let token = batch.active().unwrap().token;
+        effects = batch.reduce(Event::Finished {
+            token,
+            outcome: ScanOutcome::Published {
+                scan: success.snapshot.scan,
+                partial: false,
+            },
+        });
+        let token = batch.active().unwrap().token;
+        assert_eq!(token.card_id, CardId(3));
+        assert_eq!(batch.queued_total(), 1);
+        assert!(matches!(
+            batch.reduce(Event::Stop).as_slice(),
+            [Effect::Cancel { .. }]
+        ));
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        assert!(execute(&effects[0], &cancel).unwrap().is_none());
+        assert!(batch.stopping());
+        assert!(
+            batch
+                .reduce(Event::Finished {
+                    token,
+                    outcome: ScanOutcome::Cancelled
+                })
+                .is_empty()
+        );
+        assert!(!batch.is_busy());
+        let cache = lock(&opened.backend).unwrap();
+        assert_eq!(
+            cache.latest(prior.snapshot.root.id).unwrap(),
+            Some(prior.snapshot.scan)
+        );
+        assert_eq!(cache.scans(None, 100).unwrap().scans.len(), 2);
+        assert_eq!(
+            std::fs::read(fixture.0.join("old-disk-1/kept")).unwrap(),
+            b"123"
+        );
+        assert_eq!(
+            std::fs::read(fixture.0.join("disk-4/kept")).unwrap(),
+            b"123"
         );
     }
 }

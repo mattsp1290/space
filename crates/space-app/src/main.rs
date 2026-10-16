@@ -2,10 +2,18 @@ mod backend;
 mod cache_management;
 mod changes_controller;
 mod changes_panel;
+mod dashboard;
+mod dashboard_controller;
+mod dashboard_render;
+#[cfg(test)]
+mod dashboard_transition_tests;
 mod deferred;
+mod disk_model;
+mod explorer;
 mod filters;
 mod intent;
 mod paths;
+mod scan_batch;
 mod text_input;
 mod treemap;
 
@@ -54,7 +62,6 @@ actions!(
         ToggleMetric,
         NextPage,
         FirstPage,
-        NextSavedRoot,
         FocusNext,
         FocusPrevious,
         CloseWindow
@@ -84,6 +91,7 @@ impl Drop for Running {
 
 type FilterSession = deferred::Deferred<backend::Filtered>;
 struct Space {
+    disks: dashboard_controller::State,
     changes: changes_controller::State,
     executor: gpui::BackgroundExecutor,
     filters_visible: bool,
@@ -93,9 +101,6 @@ struct Space {
     cache_epoch: u64,
     maintenance_busy: bool,
     volumes: Option<space_scan::VolumeListing>,
-    volume_busy: bool,
-    volume_page: usize,
-    volumes_visible: bool,
     focus: FocusHandle,
     list_focus: FocusHandle,
     scroll: UniformListScrollHandle,
@@ -109,7 +114,6 @@ struct Space {
     running: Option<Running>,
     generation: u64,
     status: String,
-    scan_status: String,
     view: View,
     metric: Metric,
     applied_metric: Metric,
@@ -129,7 +133,6 @@ struct Space {
     query_busy: bool,
     pending_query: Option<(u64, Query)>,
     snapshot_request: u64,
-    root_busy: bool,
     filter_inputs: Vec<gpui::Entity<text_input::TextInput>>,
     filter_subscriptions: Vec<gpui::Subscription>,
     filter_config: space_store::QueryFilter,
@@ -219,7 +222,7 @@ fn total_text(row: &StoredEntry, metric: Metric) -> String {
         Metric::Logical => row.logical,
         Metric::Allocated => row.allocated,
     };
-    let mut text = format!("{} B", total.observed_bytes);
+    let mut text = dashboard::format_bytes(total.observed_bytes);
     if total.unknown_count > 0 {
         text.push_str(&format!(" + {} unknown", total.unknown_count));
     }
@@ -234,6 +237,7 @@ impl Space {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let mut app = Self {
+            disks: dashboard_controller::State::default(),
             changes: changes_controller::State::new(cx.background_executor().clone()),
             executor: cx.background_executor().clone(),
             filters_visible: false,
@@ -243,9 +247,6 @@ impl Space {
             cache_epoch: 0,
             maintenance_busy: false,
             volumes: None,
-            volume_busy: false,
-            volume_page: 0,
-            volumes_visible: false,
             focus,
             list_focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
@@ -259,8 +260,7 @@ impl Space {
             running: None,
             generation: 0,
             status: "Opening local cache…".into(),
-            scan_status: "No scan running.".into(),
-            view: View::Folders,
+            view: View::Treemap,
             metric: Metric::Logical,
             applied_metric: Metric::Logical,
             applied_filter: space_store::QueryFilter::default(),
@@ -279,7 +279,6 @@ impl Space {
             query_busy: false,
             pending_query: None,
             snapshot_request: 0,
-            root_busy: false,
             filter_inputs: [
                 ("Name contains", "literal text"),
                 ("Path contains", "relative display path"),
@@ -322,7 +321,7 @@ impl Space {
             })
             .collect();
         app.initialize(cx);
-        app.load_volumes(cx);
+
         app
     }
     fn show_aliases(&mut self, _: &ShowAliases, _: &mut Window, cx: &mut Context<Self>) {
@@ -539,9 +538,10 @@ impl Space {
             && !self.filter_busy
             && !self.query_busy
             && !self.intent.path_busy
-            && !self.root_busy
             && !self.alias_busy
             && self.changes.idle()
+            && !self.picker_open
+            && self.disks.idle()
     }
     fn confirm_cache_removal(
         &mut self,
@@ -580,10 +580,11 @@ impl Space {
             let snapshot=this.snapshot.take();let pending=this.pending_snapshot.take();
             let filtered=this.filter_session.take();
             let comparison=this.changes.session.take();this.changes.invalidate();
+            let card_pins=this.disks.release_cards();
             this.rows.clear();this.row_paths.clear();this.clear_aliases();this.breadcrumbs.clear();clear_chart(&mut this.treemap,&mut this.chart_selected);this.current_totals=None;
             let task=cx.background_executor().spawn(async move {
                 if let Some((_,query))=pending_query && let Some(filtered)=query.filtered{filtered.close_on_worker();}
-                drop(snapshot);drop(pending);if let Some(filtered)=filtered{filtered.close_on_worker();}
+                drop(card_pins);drop(snapshot);drop(pending);if let Some(filtered)=filtered{filtered.close_on_worker();}
                 if let Some(comparison)=comparison{comparison.close_on_worker();}
                 let outcome=backend::remove_cached(&backend,scan);
                 let reloaded=backend::reload(&backend);
@@ -593,40 +594,31 @@ impl Space {
                 this.maintenance_busy=false;this.cache_model.busy=false;
                 this.cache_model.warning=Some(match outcome {Ok(())=>"Cached metadata removed. Source files were untouched.".into(),Err(error)=>format!("Cache removal failed: {error}")});
                 match reloaded {Ok(state)=>{this.roots=state.roots;if let Some(snapshot)=state.snapshot{this.apply_snapshot(snapshot,cx);}else{this.clear_empty_view();}},Err(error)=>this.status=format!("Cache reload failed: {error}")}
-                this.load_cache_panel(None,None,None,cx);cx.notify();
+                this.reconcile_disks(cx);this.load_cache_panel(None,None,None,cx);cx.notify();
             });}).detach();cx.notify();
         });}).detach();
         cx.notify();
     }
     fn load_volumes(&mut self, cx: &mut Context<Self>) {
-        if self.volume_busy {
-            return;
-        }
-        self.volume_busy = true;
-        let task = cx
-            .background_executor()
-            .spawn(async { space_scan::enumerate_volumes() });
-        cx.spawn(async move |this,cx| {let result=task.await;let _=this.update(cx,|this,cx| {
-            this.volume_busy=false;
-            match result {Ok(listing)=>{this.volumes=Some(listing);this.volume_page=0;},Err(error)=>this.status=format!("Volume discovery unavailable: {error}. Choose Folder remains available.")}
-            cx.notify();
-        });}).detach();
-        cx.notify();
+        self.discover_disks(None, cx);
     }
     fn refresh_volumes(&mut self, _: &RefreshVolumes, _: &mut Window, cx: &mut Context<Self>) {
-        self.load_volumes(cx);
+        self.discover_disks(None, cx);
     }
     fn next_volumes(&mut self, _: &NextVolumes, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(list) = &self.volumes {
-            let pages = list.volumes.len().div_ceil(8).max(1);
-            self.volume_page = (self.volume_page + 1) % pages;
-            cx.notify();
-        }
+        self.disks.page =
+            (self.disks.page + 1) % self.disks.registry.cards().len().div_ceil(8).max(1);
+        self.queue_visible_previews(cx);
+        cx.notify();
     }
     fn initialize(&mut self, cx: &mut Context<Self>) {
         let directory = match paths::cache_directory() {
             Ok(path) => path,
             Err(error) => {
+                self.disks.initializing = false;
+                self.disks.notice = Some(format!(
+                    "Cache unavailable: {error}. Restart Space after resolving the cache location."
+                ));
                 self.status = error;
                 return;
             }
@@ -648,16 +640,28 @@ impl Space {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                this.disks.initializing = false;
                 match result {
                     Ok((backend, roots, snapshot)) => {
-                        this.backend = Some(backend); this.roots = roots;
-                        if let Some(snapshot) = snapshot { this.apply_snapshot(snapshot, cx); }
-                        else { this.status = "Choose a folder, then Scan / Refresh. No source drive is scanned automatically.".into(); }
+                        this.backend = Some(backend);
+                        this.roots = roots;
+                        drop(snapshot);
+                        this.reconcile_disks(cx);
+                        this.load_volumes(cx);
+                        this.status =
+                            "Choose Scan all disks to begin, or open an existing cached map."
+                                .into();
                     }
-                    Err(error) => this.status = format!("Cache unavailable: {error}. Original data was not replaced."),
-                } cx.notify();
+                    Err(error) => {
+                        this.status =
+                            format!("Cache unavailable: {error}. Original data was not replaced. Restart Space after resolving the cache error.");
+                        this.disks.notice = Some(this.status.clone())
+                    }
+                }
+                cx.notify();
             });
-        }).detach();
+        })
+        .detach();
     }
     fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
         self.changes.invalidate();
@@ -665,138 +669,32 @@ impl Space {
         self.pending_snapshot = Some(Arc::new(snapshot));
         self.rebuild_filters(cx);
     }
-    fn commit_pending_snapshot(&mut self) {
+    fn commit_pending_snapshot(&mut self) -> Option<PageCursor> {
         if let Some(snapshot) = self.pending_snapshot.take() {
             self.breadcrumbs = vec![(
                 snapshot.root_entry.entry.node,
                 snapshot.root_entry.entry.display_name.clone(),
             )];
+            self.disks.displayed_scope = None;
+            self.disks.page_cursor = None;
+            self.restore_disk_bookmark(&snapshot);
             self.snapshot = Some(snapshot);
             self.status="Showing an immutable cached scan. Live root has not been revalidated; offline browsing is available.".into();
+            return self.disks.page_cursor;
         }
+        None
     }
     fn choose_folder(&mut self, _: &ChooseFolder, _: &mut Window, cx: &mut Context<Self>) {
-        if self.picker_open {
-            return;
-        }
-        self.picker_open = true;
-        let result = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose folder to scan".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let result = result.await;
-            let _ = this.update(cx, |this, cx| {
-                this.picker_open = false;
-                match result {
-                    Ok(Ok(Some(paths))) => if let Some(path) = paths.into_iter().next() {
-                        this.intent.chosen = Some(path); this.status = "Folder selected. Press Scan / Refresh to scan; existing cached view stays visible.".into();
-                    },
-                    Ok(Ok(None)) => this.status = "Folder selection cancelled; previous selection retained.".into(),
-                    Ok(Err(error)) => this.status = format!("Folder picker failed: {error}"),
-                    Err(error) => this.status = format!("Folder picker closed unexpectedly: {error}"),
-                } cx.notify();
-            });
-        }).detach();
-        cx.notify();
+        self.scan_folder_picker(cx);
     }
     fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
-        if self.maintenance_busy {
-            return;
-        }
-        if self.running.is_some() {
-            self.status = "A scan is still active. Cancel it and wait for writer shutdown before starting another.".into();
-            cx.notify();
-            return;
-        }
-        let (Some(backend), Some(cache_directory)) =
-            (self.backend.clone(), self.cache_directory.clone())
-        else {
-            return;
-        };
-        let (path, refresh_root) = if let Some(path) = &self.intent.chosen {
-            (path.clone(), None)
-        } else if let Some(snapshot) = &self.snapshot {
-            match snapshot.path.to_path_buf() {
-                Ok(path) => (path, Some(snapshot.root.clone())),
-                Err(error) => {
-                    self.status = error.to_string();
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            self.status = "Choose a folder first.".into();
-            cx.notify();
-            return;
-        };
-        // Consume this request now; later picker choices survive asynchronous publication.
-        self.intent.consume_choice();
-        self.generation += 1;
-        let generation = self.generation;
-        let cancel = Cancellation::new();
-        let progress = Arc::new(backend::Progress::default());
-        self.running = Some(Running {
-            cancel: cancel.clone(),
-            progress: progress.clone(),
-            generation,
-            executor: cx.background_executor().clone(),
-            cancel_requested: false,
-            armed: true,
-        });
-        self.scan_status = format!(
-            "Scanning {}. The displayed cache remains the previous published snapshot.",
-            path.to_string_lossy()
-        );
-        let request = backend::ScanRequest {
-            path,
-            cache_directory,
-            refresh_root,
-            generation,
-        };
-        let task = cx
-            .background_executor()
-            .spawn(async move { backend::scan(&backend, request, &cancel, &progress) });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.running.as_ref().is_none_or(|run|run.generation != generation) { return; }
-                if let Some(run) = &mut this.running { run.armed = false; }
-                this.running = None;
-                match result {
-                    Ok(Some(done)) => { this.roots = done.roots; this.scan_status = done.maintenance_warning.map(|warning|format!("Scan published; cache maintenance warning: {warning}")).unwrap_or_else(||"Scan published. Coverage and unknown bytes are shown with cached totals.".into()); this.apply_snapshot(done.snapshot, cx); }
-                    Ok(None) => this.scan_status = "Scan cancelled. Previous published scan retained.".into(),
-                    Err(error) => this.scan_status = format!("Scan stopped: {error}. The current cached view remains available; reopen the saved root to inspect the latest publication."),
-                } cx.notify();
-            });
-        }).detach();
-        let executor = cx.background_executor().clone();
-        cx.spawn(async move |this, cx| {
-            loop {
-                executor.timer(Duration::from_millis(100)).await;
-                if !this
-                    .update(cx, |this, cx| {
-                        let active = this
-                            .running
-                            .as_ref()
-                            .is_some_and(|r| r.generation == generation);
-                        if active {
-                            cx.notify();
-                        }
-                        active
-                    })
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-        cx.notify();
+        self.rescan_selected_disk(cx);
     }
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.disks.batch.is_busy() || self.disks.folder_preflight || self.picker_open {
+            self.stop_acquisition(cx);
+            return;
+        }
         if self.running.is_none() && self.changes.build_busy {
             if let Some(build) = self.changes.model.building {
                 let event = self
@@ -823,7 +721,7 @@ impl Space {
                     })
                     .detach();
             }
-            self.scan_status = "Cancellation requested. Waiting for the worker; a blocked OS call may take longer.".into();
+            self.disks.notice = Some("Stopping; waiting for the worker acknowledgement.".into());
         }
         cx.notify();
     }
@@ -845,6 +743,7 @@ impl Space {
         self.filter_epoch += 1;
         self.filter_pending = None;
         self.pending_snapshot = None;
+        self.disks.cancel_navigation();
         self.filter_config = self.applied_filter.clone();
         self.metric = self.applied_metric;
         if let Some(cancel) = self.filter_cancel.take() {
@@ -855,6 +754,7 @@ impl Space {
                 .detach();
         }
         self.filter_status="Filter cancelled; previous applied results retained. Draft inputs can be applied again.".into();
+        self.queue_visible_previews(cx);
         cx.notify();
     }
     fn apply_filter_inputs(&mut self, cx: &mut Context<Self>) {
@@ -886,6 +786,8 @@ impl Space {
         match fields.apply_to(&mut self.filter_config) {
             Ok(()) => {
                 self.filter_error = None;
+                self.disks.explorer_notice = None;
+                self.disks.invalidate_page_order();
                 self.rebuild_filters(cx);
             }
             Err(error) => {
@@ -920,12 +822,12 @@ impl Space {
         cx: &mut Context<Self>,
     ) {
         if config.is_empty() {
-            self.commit_pending_snapshot();
+            let cursor = self.commit_pending_snapshot();
             self.filter_session = None;
             self.applied_filter = config;
             self.applied_metric = self.metric;
             self.filter_status = "Unfiltered totals".into();
-            self.request_query(None, cx);
+            self.request_query(cursor, cx);
             return;
         }
         let (Some(backend), Some(snapshot)) = (
@@ -962,15 +864,15 @@ impl Space {
                 if this.filter_epoch == epoch {
                     match result {
                         Ok(session) => {
-                            this.commit_pending_snapshot();
+                            let cursor = this.commit_pending_snapshot();
                             this.applied_metric=metric;
                             this.applied_filter=applied_config;
                             let filtered=&session;
                             this.filter_status=format!("Filtered: {} matching non-directory paths (aliases included) · {}. Canonical owners alone contribute bytes; coverage remains conservative.",filtered.matching_count,total_text(&filtered.root,metric));
                             this.filter_session=Some(session);
-                            this.request_query(None,cx);
+                            this.request_query(cursor,cx);
                         }
-                        Err(error) => this.filter_status=format!("Filter failed: {error}. Previous applied view remains available."),
+                        Err(error) => { this.pending_snapshot = None; this.disks.cancel_navigation(); this.filter_status=format!("Filter failed: {error}. Previous applied view remains available."); },
                     }
                 }
                 if let Some((epoch,config))=this.filter_pending.take() {this.start_filter(epoch,config,cx);}
@@ -992,6 +894,7 @@ impl Space {
         self.draft_unknown_size = false;
         self.draft_unknown_time = false;
         self.filter_error = None;
+        self.disks.invalidate_page_order();
         self.rebuild_filters(cx);
     }
     fn unknown_size(&mut self, _: &ToggleUnknownSize, _: &mut Window, cx: &mut Context<Self>) {
@@ -1040,6 +943,8 @@ impl Space {
         if self.maintenance_busy {
             return;
         }
+        self.remember_scope_page();
+        self.disks.page_cursor = cursor;
         let (Some(snapshot), Some((parent, _))) = (&self.snapshot, self.breadcrumbs.last()) else {
             return;
         };
@@ -1084,6 +989,8 @@ impl Space {
             return;
         };
         self.query_busy = true;
+        let scan = query.scan;
+        let parent = query.parent;
         let task = cx.background_executor().spawn(async move {
             let _pin = pin;
             backend::query(&backend, query)
@@ -1134,6 +1041,7 @@ impl Space {
                             this.rows = result.page.entries;
                             this.next_page = result.page.next;
                             this.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                            this.restore_query_selection(scan, parent);
                         }
                         Err(error) => this.status = format!("Cached query failed: {error}"),
                     }
@@ -1161,12 +1069,14 @@ impl Space {
             cx.notify();
             return;
         }
+        self.disks.invalidate_page_order();
         self.metric = if self.metric == Metric::Logical {
             Metric::Allocated
         } else {
             Metric::Logical
         };
         self.rebuild_filters(cx);
+        self.queue_visible_previews(cx);
     }
     fn next_page(&mut self, _: &NextPage, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(cursor) = self.next_page {
@@ -1196,51 +1106,24 @@ impl Space {
         {
             self.breadcrumbs
                 .push((row.entry.node, row.entry.display_name.clone()));
-            self.view = View::Folders;
+            if self.view == View::Largest {
+                self.view = View::Treemap;
+            }
             self.request_query(None, cx);
         }
     }
     fn up(&mut self, _: &GoUp, _: &mut Window, cx: &mut Context<Self>) {
         if self.breadcrumbs.len() > 1 {
-            self.breadcrumbs.pop();
-            self.view = View::Folders;
-            self.request_query(None, cx);
+            let exited = self.breadcrumbs.pop().unwrap().0;
+            let parent = self.breadcrumbs.last().unwrap().0;
+            if let Some(snapshot) = &self.snapshot {
+                self.disks.restore_selection = Some((snapshot.scan, exited));
+            }
+            if self.view == View::Largest {
+                self.view = View::Treemap;
+            }
+            self.request_query(self.saved_scope_page(parent), cx);
         }
-    }
-    fn next_saved(&mut self, _: &NextSavedRoot, _: &mut Window, cx: &mut Context<Self>) {
-        if self.maintenance_busy || self.root_busy || self.roots.is_empty() {
-            return;
-        }
-        let index = self
-            .snapshot
-            .as_ref()
-            .and_then(|s| self.roots.iter().position(|r| r.id == s.root.id))
-            .map_or(0, |index| (index + 1) % self.roots.len());
-        let Some(backend) = self.backend.clone() else {
-            return;
-        };
-        self.root_busy = true;
-        let root = self.roots[index].clone();
-        self.snapshot_request += 1;
-        let generation = self.snapshot_request;
-        let task = cx
-            .background_executor()
-            .spawn(async move { backend::open_root(&backend, root) });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                this.root_busy = false;
-                if this.snapshot_request != generation {
-                    return;
-                }
-                match result {
-                    Ok(snapshot) => this.apply_snapshot(snapshot, cx),
-                    Err(error) => this.status = error,
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
     fn path_action(&mut self, reveal: bool, cx: &mut Context<Self>) {
         if self.maintenance_busy || self.intent.path_busy {
@@ -1280,137 +1163,52 @@ impl Space {
 }
 
 impl Render for Space {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let metric = if self.applied_metric == Metric::Logical {
-            "logical / apparent"
-        } else {
-            "allocated (unknown excluded from largest)"
-        };
-        let progress = self
-            .running
-            .as_ref()
-            .map(|r| {
-                format!(
-                    "{} observed entries · {} stored batches",
-                    r.progress.entries.load(Ordering::Relaxed),
-                    r.progress.batches.load(Ordering::Relaxed)
-                )
-            })
-            .unwrap_or_default();
-        let snapshot_label=self.snapshot.as_ref().map(|s|format!("Cached scan {} (unfiltered root) · {} · {} · {} errors · {} unknown entries · {} excluded/boundary scopes",s.scan.get(),s.path.to_path_buf().map(|p|p.to_string_lossy().into_owned()).unwrap_or_else(|_|"Foreign native path".into()),total_text(&s.root_entry,self.applied_metric),s.root_entry.coverage.error_count,s.root_entry.coverage.unknown_entries,s.root_entry.coverage.excluded_scopes+s.root_entry.coverage.boundary_scopes)).unwrap_or_else(||"No published scan yet.".into());
-        let interval_label = self
-            .snapshot
-            .as_ref()
-            .map(|snapshot| {
-                let display = |time: space_core::Timestamp| {
-                    chrono::DateTime::from_timestamp(time.seconds, time.nanos)
-                        .map(|date| date.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                        .unwrap_or_else(|| "timestamp unavailable".into())
-                };
-                format!(
-                    "Observed {} → {} (an observation interval, not an atomic filesystem snapshot)",
-                    display(snapshot.interval.0),
-                    snapshot
-                        .interval
-                        .1
-                        .map(display)
-                        .unwrap_or_else(|| "unfinished".into())
-                )
-            })
-            .unwrap_or_default();
-        let chosen = self
-            .intent
-            .chosen
-            .as_ref()
-            .map(|p| format!("Next scan: {}", p.to_string_lossy()))
-            .unwrap_or_default();
-        let view = match self.view {
-            View::Folders => "Folders: charged size descending",
-            View::Largest => "Largest files: charged unique size descending",
-            View::Treemap => "Treemap: current folder, bounded tiles with Other",
-        };
-        div().id("space").role(Role::Application).aria_label("Space disk explorer").track_focus(&self.focus).key_context("Space")
-            .on_action(cx.listener(Self::choose_folder)).on_action(cx.listener(Self::refresh)).on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::show_changes)).on_action(cx.listener(Self::show_aliases)).on_action(cx.listener(Self::next_aliases)).on_action(cx.listener(Self::show_cache)).on_action(cx.listener(Self::refresh_volumes)).on_action(cx.listener(Self::next_volumes))
-            .on_action(cx.listener(Self::show_treemap)).on_action(cx.listener(Self::toggle_subtree)).on_action(cx.listener(Self::toggle_filters)).on_action(cx.listener(Self::reset_filters)).on_action(cx.listener(Self::apply_filters)).on_action(cx.listener(Self::cancel_filter)).on_action(cx.listener(Self::unknown_size)).on_action(cx.listener(Self::unknown_time))
-            .on_action(cx.listener(Self::folders)).on_action(cx.listener(Self::largest)).on_action(cx.listener(Self::metric))
-            .on_action(cx.listener(Self::up)).on_action(cx.listener(Self::next_page)).on_action(cx.listener(Self::first_page)).on_action(cx.listener(Self::next_saved))
-            .on_action(cx.listener(|this,_:&CopyPath,_,cx|this.path_action(false,cx)))
-            .on_action(cx.listener(|this,_:&RevealPath,_,cx|this.path_action(true,cx)))
-            .on_action(cx.listener(|_,_:&FocusNext,w,cx|w.focus_next(cx))).on_action(cx.listener(|_,_:&FocusPrevious,w,cx|w.focus_prev(cx)))
-            .on_action(|_:&CloseWindow,w,_|w.remove_window())
-            .size_full().overflow_y_scroll().flex().flex_col().gap_2().p_4().bg(rgb(0x17212b)).text_color(rgb(0xe6edf3))
-            .child(div().text_xl().child("Space · local disk explorer"))
-            .child(div().flex().flex_wrap().gap_2()
-                .child(control("choose","Choose folder (Ctrl+O)").on_click(cx.listener(|t,_,w,cx|t.choose_folder(&ChooseFolder,w,cx))))
-                .child(control("refresh","Scan / Refresh (Ctrl+R)").on_click(cx.listener(|t,_,w,cx|t.refresh(&Refresh,w,cx))))
-                .child(control("cancel","Cancel (Esc)").on_click(cx.listener(|t,_,w,cx|t.cancel(&Cancel,w,cx))))
-                .child(control("changes","Changes / Explorer").on_click(cx.listener(|t,_,w,cx|t.show_changes(&ShowChanges,w,cx))))
-                .child(control("cache","Cache / diagnostics").on_click(cx.listener(|t,_,w,cx|t.show_cache(&ShowCache,w,cx))))
-                .child(control("saved","Next saved root").on_click(cx.listener(|t,_,w,cx|t.next_saved(&NextSavedRoot,w,cx)))))
-            .child(control("volume-toggle","Show / hide mounted targets").on_click(cx.listener(|t,_,_,cx|{t.volumes_visible = !t.volumes_visible;cx.notify();})))
-            .when(self.volumes_visible,|e|e.child(div().flex().gap_2().child(control("volume-refresh","Refresh mounted targets").on_click(cx.listener(|t,_,w,cx|t.refresh_volumes(&RefreshVolumes,w,cx))))
-                .child(control("volume-next","Next targets page").on_click(cx.listener(|t,_,w,cx|t.next_volumes(&NextVolumes,w,cx)))))
-            .child(if self.volume_busy {"Reading OS mount metadata…"}else{"Mounted targets: choose one, then explicitly Scan. Capacity is OS available space, separate from scan totals."})
-            .when_some(self.volumes.as_ref(),|e,list|e.child(format!("Observed mounts at {} UTC-seconds · {} targets · {} discovery issues · complete: {}",list.observed_at.seconds,list.volumes.len(),list.issues.len(),list.complete))
-                .child(div().flex().flex_wrap().gap_2().children(list.volumes.iter().enumerate().skip(self.volume_page*8).take(8).map(|(ix,volume)|{
-                    let path=volume.mount_path.clone();
-                    let label=format!("{} · {} · {} · removable {:?} · {}",volume.label,volume.aliases.first().unwrap_or(&volume.mount_path).to_path_buf().map(|p|p.to_string_lossy().into_owned()).unwrap_or_else(|_|"Foreign native path".into()),volume.filesystem,volume.removable,volume.capacity.as_ref().map(|c|format!("{} available / {} capacity bytes",c.available_bytes,c.total_bytes)).unwrap_or_else(||"capacity unknown".into()));
-                    div().id(("volume",ix)).role(Role::Button).aria_label(SharedString::from(label.clone())).focusable().tab_stop(true).border_2().border_color(rgb(0x285166)).focus(|s|s.border_color(rgb(0x90d5ff))).px_2().py_1().cursor_pointer().on_click(cx.listener(move|t,_,_,cx|{match path.to_path_buf(){Ok(path)=>{t.intent.chosen=Some(path);t.status="Mounted target selected. Press Scan / Refresh to start; identity is checked again.".into();},Err(error)=>t.status=error.to_string()}cx.notify();})).child(label)
-                }))))
-            )
-            .child(chosen).child(snapshot_label).child(interval_label).child(self.scan_status.clone()).child(progress)
-            .child(div().flex().flex_wrap().gap_2()
-                .child(control("folders","Folders").on_click(cx.listener(|t,_,w,cx|t.folders(&Folders,w,cx))))
-                .child(control("chart","Treemap").on_click(cx.listener(|t,_,w,cx|t.show_treemap(&ShowTreemap,w,cx))))
-                .child(control("scope","Toggle largest: root / subtree").on_click(cx.listener(|t,_,w,cx|t.toggle_subtree(&ToggleSubtree,w,cx))))
-                .child(control("filters","Show / hide filters").on_click(cx.listener(|t,_,w,cx|t.toggle_filters(&ToggleFilters,w,cx))))
-                .child(control("largest","Largest files").on_click(cx.listener(|t,_,w,cx|t.largest(&Largest,w,cx))))
-                .child(control("metric","Toggle size metric").on_click(cx.listener(|t,_,w,cx|t.metric(&ToggleMetric,w,cx))))
-                .child(control("up","Up (Alt+Up)").on_click(cx.listener(|t,_,w,cx|t.up(&GoUp,w,cx))))
-                .child(control("open","Open folder (Enter)").on_click(cx.listener(|t,_,w,cx|t.open_row(&OpenRow,w,cx)))))
-            .when(self.filters_visible && !self.changes.visible,|e|e.child(div().flex().flex_wrap().gap_2().children(self.filter_inputs.iter().cloned().enumerate().map(|(ix,input)|div().id(("field",ix)).w(px(220.)).child(input))))
-                .child(div().flex().gap_2().child(control("apply-filter","Apply filters").on_click(cx.listener(|t,_,w,cx|t.apply_filters(&ApplyFilters,w,cx))))
-                .child(control("cancel-filter","Cancel filter").on_click(cx.listener(|t,_,w,cx|t.cancel_filter(&CancelFilter,w,cx))))
-                .child(control("reset","Reset filters").on_click(cx.listener(|t,_,w,cx|t.reset_filters(&ResetFilters,w,cx))))
-                .child(control("unknown-size","Toggle unknown size").on_click(cx.listener(|t,_,w,cx|t.unknown_size(&ToggleUnknownSize,w,cx))))
-                .child(control("unknown-time","Toggle unknown time").on_click(cx.listener(|t,_,w,cx|t.unknown_time(&ToggleUnknownTime,w,cx))))))
-            .child(self.filter_error.clone().unwrap_or_default())
-            .child(format!("{} · constrained unknown size: {} · constrained unknown time: {}",self.filter_status,self.applied_filter.include_unknown_size,self.applied_filter.include_unknown_time))
-            .child(format!("{view} · {metric}"))
-            .child(format!("Scope: {}",if self.view == View::Largest && !self.subtree_only {"whole saved root".into()} else {self.breadcrumbs.iter().map(|(_,name)|name.as_str()).collect::<Vec<_>>().join(" / ")}))
-            .child(self.current_totals.as_ref().map(|row|format!("Current folder{}: {}",if self.filter_session.is_some(){" (filtered)"}else{""},total_text(row,self.applied_metric))).unwrap_or_default())
-            .child(self.status.clone())
-            .when(self.changes.visible,|e|e.child(changes_panel::render(&self.changes.model,cx,Self::changes_event)))
-            .when(self.cache_visible,|e|e.child(cache_management::render(&self.cache_model,cx,Self::cache_event)))
-            .when(self.view==View::Treemap,|e|e.child(treemap::view(&self.treemap,self.chart_selected,cx,Self::chart_event)))
-            .child(div().id("entries").role(Role::ListBox).aria_label("Cached entries").track_focus(&self.list_focus).tab_stop(true).key_context("SpaceList")
-                .flex_1().min_h(px(220.)).flex_shrink_0().border_2().border_color(rgb(0x285166)).focus(|s|s.border_color(rgb(0x90d5ff)))
-                .on_action(cx.listener(|t,_:&NextRow,_,cx|t.move_selection(1,cx))).on_action(cx.listener(|t,_:&PreviousRow,_,cx|t.move_selection(-1,cx)))
-                .on_action(cx.listener(Self::open_row))
-                .child(uniform_list("rows",self.rows.len(),cx.processor(|this,range:std::ops::Range<usize>,_,cx|{
-                    range.map(|ix|{let row=&this.rows[ix];let label=format!("{} {} {}{} · modified {} · {}{}",if ix==this.selected {">"}else{" "},if row.entry.kind==EntryKind::Directory {"[folder]"}else{"[file]"},row.entry.display_name,this.row_paths.get(ix).map(|p|format!(" · {p}")).unwrap_or_default(),row.entry.modified.and_then(|t|chrono::DateTime::from_timestamp(t.seconds,t.nanos)).map(|t|t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(||"unknown".into()),total_text(row,this.applied_metric),if !row.canonical {" · hardlink alias"}else{""});
-                        div().id(ix).role(Role::ListBoxOption).aria_label(SharedString::from(label.clone())).aria_selected(ix==this.selected)
-                            .aria_position_in_set(ix+1).aria_size_of_set(this.rows.len()).h(px(30.)).px_2().cursor_pointer()
-                            .when(ix==this.selected,|e|e.bg(rgb(0x285166)).aria_active_descendant())
-                            .on_click(cx.listener(move |t,_,w,cx|{w.focus(&t.list_focus,cx);t.clear_aliases();t.selected=ix;t.chart_selected=t.rows.get(ix).map(|r|r.entry.node);cx.notify();})).child(label)
-                    }).collect::<Vec<_>>()
-                })).track_scroll(&self.scroll).h_full()))
-            .when(!self.alias_nodes.is_empty(),|e|e.child(div().id("alias-list").max_h(px(120.)).overflow_y_scroll().children(self.alias_nodes.iter().map(|(node,path)|{
-                let node=*node;let generation=self.alias_generation;let scan=self.snapshot.as_ref().map(|s|s.scan);let label=format!("{} {}",if self.alias_selected==Some(node){">"}else{" "},path);
-                div().id(("alias",node.get() as usize)).role(Role::Button).aria_label(SharedString::from(label.clone())).focusable().tab_stop(true).focus(|s|s.bg(rgb(0x285166))).cursor_pointer().on_click(cx.listener(move|t,_,_,cx|{if alias_selection_is_current((generation,scan),(t.alias_generation,t.snapshot.as_ref().map(|s|s.scan)),node,&t.alias_nodes){t.alias_selected=Some(node);cx.notify();}})).child(label)
-            }))))
-            .child(if self.query_busy {"Loading cached page…"}else if self.rows.is_empty(){"No entries in this view."}else{""})
-            .child(div().flex().flex_wrap().gap_2()
-                .child(control("first","First page").on_click(cx.listener(|t,_,w,cx|t.first_page(&FirstPage,w,cx))))
-                .child(control("next","Next page").on_click(cx.listener(|t,_,w,cx|t.next_page(&NextPage,w,cx))))
-                .child(control("aliases","Choose hardlink alias").on_click(cx.listener(|t,_,w,cx|t.show_aliases(&ShowAliases,w,cx))))
-                .child(control("aliases-next","Next aliases").on_click(cx.listener(|t,_,w,cx|t.next_aliases(&NextAliases,w,cx))))
-                .child(control("copy","Copy path (Ctrl+Shift+C)").on_click(cx.listener(|t,_,_,cx|t.path_action(false,cx))))
-                .child(control("reveal","Reveal (Ctrl+Shift+R)").on_click(cx.listener(|t,_,_,cx|t.path_action(true,cx)))))
-            .child("Metadata only. Totals describe observed included files, not reclaimable space. No deletion or content opening.")
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let screen = self.render_screen(window, cx);
+        div()
+            .id("space")
+            .role(Role::Application)
+            .aria_label("Space disk explorer")
+            .track_focus(&self.focus)
+            .key_context("Space")
+            .on_action(cx.listener(Self::choose_folder))
+            .on_action(cx.listener(Self::refresh))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::show_changes))
+            .on_action(cx.listener(Self::show_aliases))
+            .on_action(cx.listener(Self::next_aliases))
+            .on_action(cx.listener(Self::show_cache))
+            .on_action(cx.listener(Self::refresh_volumes))
+            .on_action(cx.listener(Self::next_volumes))
+            .on_action(cx.listener(Self::show_treemap))
+            .on_action(cx.listener(Self::toggle_subtree))
+            .on_action(cx.listener(Self::toggle_filters))
+            .on_action(cx.listener(Self::reset_filters))
+            .on_action(cx.listener(Self::apply_filters))
+            .on_action(cx.listener(Self::cancel_filter))
+            .on_action(cx.listener(Self::unknown_size))
+            .on_action(cx.listener(Self::unknown_time))
+            .on_action(cx.listener(Self::folders))
+            .on_action(cx.listener(Self::largest))
+            .on_action(cx.listener(Self::metric))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::next_page))
+            .on_action(cx.listener(Self::first_page))
+            .on_action(cx.listener(|this, _: &CopyPath, _, cx| this.path_action(false, cx)))
+            .on_action(cx.listener(|this, _: &RevealPath, _, cx| this.path_action(true, cx)))
+            .on_action(cx.listener(|_, _: &FocusNext, w, cx| w.focus_next(cx)))
+            .on_action(cx.listener(|_, _: &FocusPrevious, w, cx| w.focus_prev(cx)))
+            .on_action(|_: &CloseWindow, w, _| w.remove_window())
+            .size_full()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x12212c))
+            .text_color(rgb(0xe6edf3))
+            .child(screen)
     }
 }
+
 fn main() {
     if std::env::args().any(|arg| arg == "--version") {
         println!("Space {} (development)", env!("CARGO_PKG_VERSION"));
@@ -1444,7 +1242,7 @@ fn main() {
             }
         })
         .detach();
-        let bounds = Bounds::centered(None, size(px(1100.), px(820.)), cx);
+        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         if let Err(error) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
