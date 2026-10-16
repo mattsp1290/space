@@ -1,4 +1,8 @@
 # Follow-on: Changes
+
+## Acceptance update — 2026-10-16
+Matt explicitly accepts passing CI as the current platform acceptance gate. Real desktop/laptop UI, GPU, accessibility and clean-machine checks are deferred follow-up validation, not blockers for G0 or subsequent feature work. Native-target CI must pass formatting, Clippy, tests, release builds, package assembly and extracted CLI smoke on all four targets. Do not describe this as observed GUI or real-hardware success. The detailed native procedures below remain the later validation checklist. License/distribution safeguards remain separate.
+
 Prerequisite: all first-release gates pass and immutable scan/coverage semantics are stable. This is approved follow-on scope, not a reason to delay the first useful tree/largest-files milestone.
 
 New comparison module in space-core and indexed comparison queries in space-store; new Changes mode in space-app. Compare two finished scans from the same validated volume, selected-directory object and comparison lineage with identical scan policy and metric semantics. Show before/after timestamps and coverage. If identity or exclusions differ, refuse automatic comparison and explain what rescan is needed; do not silently compare mount paths.

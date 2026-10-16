@@ -1,7 +1,7 @@
 # Developing the G0 bootstrap
 
-The native boundary is unfinished until [platform acceptance](platform-support.md)
-is recorded. This is not yet a working disk scanner. No command below constitutes
+The current implementation gate is full four-target native CI success, under
+the owner-approved 2026-10-16 [acceptance revision](platform-support.md). This is not yet a working disk scanner. No command below constitutes
 proof of native UI behavior merely because it exits successfully.
 
 ## Prerequisites
@@ -88,10 +88,12 @@ before starting the UI. Record interactive acceptance separately.
 
 ## Validation and stopping condition
 
-Before moving beyond G0, complete every required native platform check in
-`platform-support.md`. Report missing dependencies, failed GPU startup, missing
-screen-reader support and absent test hardware as blockers. Never silently remove
-a platform or switch UI frameworks to produce a green build.
+Before moving beyond G0, all four native CI targets must pass formatting, Clippy,
+unit tests, release build, package assembly and extracted CLI smoke. Report build
+failures and observed GPU/accessibility defects honestly. Real-hardware checks in
+`platform-support.md` are deferred and missing hardware is not a current
+implementation blocker. Never silently remove a platform or switch frameworks
+to produce a green build.
 
 Local checks include shell syntax, workflow YAML parsing, the four-target matrix,
 and a dependency-inventory fixture. Linux archive assembly was tested with a
@@ -100,9 +102,8 @@ Bootstrap checks reported formatting/diff success, three standalone probe logic
 tests, and zero-test runs for the placeholder crates. Full compilation/dependency
 inventory remain blocked by dependency fetching (HTTP CONNECT 403; offline
 metadata lacks accesskit_macos 0.26.3). Development-library installation was blocked
-by the read-only environment. No native Space build, package or GUI pass is
-asserted. Read the actual CI run and record its commit and logs before claiming
-build success. Domain/scanner/store placeholders
+by the read-only environment. Those local results assert no native Space build, package or GUI pass. Hosted
+CI build/package evidence is recorded separately in `platform-support.md`. Domain/scanner/store placeholders
 are not scanner correctness or persistence tests.
 
 For eventual distribution, complete the license notice bundle and signing gates.

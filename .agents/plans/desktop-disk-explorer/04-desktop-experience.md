@@ -1,4 +1,8 @@
 # Desktop experience
+
+## Acceptance update — 2026-10-16
+Matt explicitly accepts passing CI as the current platform acceptance gate. Real desktop/laptop UI, GPU, accessibility and clean-machine checks are deferred follow-up validation, not blockers for G0 or subsequent feature work. Native-target CI must pass formatting, Clippy, tests, release builds, package assembly and extracted CLI smoke on all four targets. Do not describe this as observed GUI or real-hardware success. The detailed native procedures below remain the later validation checklist. License/distribution safeguards remain separate.
+
 New space-app modules: app_state, targets, scan_status, hierarchy, largest_files, treemap, filters, details, native_actions. Proposed modules all live under new crates/space-app/src. GPUI entities own small UI state, not the complete scan.
 
 ## First launch and reopening

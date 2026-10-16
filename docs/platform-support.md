@@ -1,9 +1,16 @@
 # Native platform status
 
-Space is at **G0, an unvalidated native bootstrap**, not a disk-explorer release.
+Space is at **G0, a native feasibility bootstrap**, not a disk-explorer release.
 The scanner, persistence, complete browsing workflow and Changes are later work.
 A green compile or `--version` check is not a native-window, GPU or accessibility
-pass. No platform has completed the acceptance matrix below.
+pass. No platform has completed the real-hardware checklist below.
+
+On 2026-10-16 the project owner approved full native CI success as the current
+implementation acceptance gate. Formatting, Clippy, tests, release compilation,
+package assembly and extracted CLI smoke must pass on all four targets before
+feature work proceeds. Interactive hardware verification is deferred, not passed.
+This changes implementation sequencing; it does not establish runtime guarantees
+or waive license, signing or later release checks.
 
 ## Candidate baseline
 
@@ -11,7 +18,7 @@ These are deliberately explicit build/test candidates, not established minimum
 supported versions. Narrowing the approved OS/architecture scope requires an
 explicit decision; a failing platform does not silently disappear.
 
-| Candidate | Native CI target | Runtime acceptance needed |
+| Candidate | Native CI target | Deferred hardware verification |
 | --- | --- | --- |
 | Linux x86_64, Ubuntu 24.04 / glibc 2.39 | `x86_64-unknown-linux-gnu` | Actual X11 **and** Wayland sessions, renderer/driver, desktop portal, clipboard and file manager |
 | Windows x86_64, Windows 11 | `x86_64-pc-windows-msvc`, built on Windows Server 2022 | Windows 11 interactive desktop, supported Direct3D renderer/driver, native dialogs and accessibility |
@@ -37,7 +44,7 @@ focus or folder picker work. Verify a functioning session bus and a suitable
 `xdg-desktop-portal` backend in each desktop session. A headless fallback can start
 without presenting a usable window.
 
-## Native acceptance record
+## Deferred real-hardware verification record
 
 Each row is pending for Linux X11, Linux Wayland, Windows, macOS ARM and macOS
 Intel. Record commit, archive SHA-256, OS version, architecture, GPU/driver,
@@ -62,9 +69,11 @@ Never replace pending with pass merely because CI is green.
   background process. Do not change a user's GPU/security configuration to test.
 - Inspect platform permissions and native runtime dependencies on a clean account.
 
-If an advertised OS cannot open the UI or select a folder, stop at G0 and report
-the exact backend/dependency failure. Native GUI tests cannot be replaced with
-headless Cargo tests. Later feature work must wait for this gate.
+Record any observed native UI or folder-selection failure with its exact backend
+and dependency evidence; do not hide it or relabel a build pass as a UI pass.
+Missing interactive test hardware does not block current implementation after
+the four-target CI gate passes. Resolve observed defects and complete this
+real-hardware checklist before claiming native behavior has been verified.
 
 ## Package and release boundaries
 
@@ -101,5 +110,21 @@ validation. Bootstrap verification reported formatting/diff checks, three standa
 logic tests, and zero-test runs for the three placeholder crates. Full compilation
 was blocked while fetching dependencies (HTTP CONNECT 403); an offline metadata
 attempt still lacked accesskit_macos 0.26.3. System dependency provisioning could
-not write to the read-only environment. No full native build, Space package or UI
-pass has occurred. Record later build results with the actual CI runs.
+not write to the read-only environment. The local shell did not complete a full native build, Space package or UI
+check. Hosted CI evidence is recorded separately below; no UI pass is claimed.
+
+## Hosted CI acceptance: 2026-10-16
+
+Commit `1fb9e0a0a3e7eef710411bcd18ea71f2ff93ec84` passed the complete
+[Native bootstrap CI run](https://github.com/mattsp1290/space/actions/runs/38928935713)
+on all four native targets: Linux x86_64, Windows x86_64, macOS ARM64 and macOS
+x86_64. Each job passed formatting, Clippy with warnings denied, workspace tests,
+release compilation, dependency inventory, package assembly and extracted-binary
+`--version` smoke. The source's three synthetic probe tests passed; placeholder
+core/scan/store crates intentionally have no feature tests yet.
+
+This satisfies the owner-approved current G0 CI gate and permits WP2/WP3 work.
+It does not demonstrate visible rendering, dialogs, screen readers, HiDPI,
+unsupported-GPU behavior or clean-machine installation. Those checks remain
+pending in the deferred hardware checklist. Only non-executable evidence was
+uploaded; generated dependency inventory is not a reviewed license-notice bundle.

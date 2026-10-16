@@ -1,4 +1,8 @@
 # Scan engine and accounting
+
+## Acceptance update — 2026-10-16
+Matt explicitly accepts passing CI as the current platform acceptance gate. Real desktop/laptop UI, GPU, accessibility and clean-machine checks are deferred follow-up validation, not blockers for G0 or subsequent feature work. Native-target CI must pass formatting, Clippy, tests, release builds, package assembly and extracted CLI smoke on all four targets. Do not describe this as observed GUI or real-hardware success. The detailed native procedures below remain the later validation checklist. License/distribution safeguards remain separate.
+
 New crate space-core defines conceptual ScanId, RootIdentity, EntryMetadata, CoverageState, Metric and ScanPolicy. New crate space-scan defines conceptual ScanController and PlatformMetadata adapters. These symbols are proposed, not preexisting. Add platform modules for Windows, macOS and Linux; keep policy common.
 
 ## Scope and traversal

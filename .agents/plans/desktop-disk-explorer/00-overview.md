@@ -1,4 +1,8 @@
 # Space: desktop disk explorer
+
+## Acceptance update — 2026-10-16
+Matt explicitly accepts passing CI as the current platform acceptance gate. Real desktop/laptop UI, GPU, accessibility and clean-machine checks are deferred follow-up validation, not blockers for G0 or subsequent feature work. Native-target CI must pass formatting, Clippy, tests, release builds, package assembly and extracted CLI smoke on all four targets. Do not describe this as observed GUI or real-hardware success. The detailed native procedures below remain the later validation checklist. License/distribution safeguards remain separate.
+
 Status: Ready. First work package: G0 platform feasibility; subsequent feature implementation depends on passing that gate. Planning only; no application implementation or native validation has occurred.
 
 ## Application context
@@ -31,7 +35,7 @@ Use GPUI/platform directly initially. Pin a tested common release/revision and t
 The minimalist case wins the first milestone: tree and largest files with instant cached reopening. The history advocate wins the storage boundary: independent immutable scans rather than a mutable disposable index. The platform advocate wins correctness: partial coverage, native paths, accounting and real OS acceptance come before extra features. A linked treemap is included in the first complete release because the user wants multiple views, but follows functional lists. Changes follows that release. Duplicate hashing, deletion/cleanup, background schedules/watchers, remote services, privileged acceleration, and filesystem snapshot management are deferred.
 
 ## Success criteria
-- Installable native packages run the core workflow on all three OSes, including Linux X11 and Wayland.
+- Native-target CI builds and tests packages on all three OSes. Actual core UI workflow and Linux X11/Wayland runtime validation are deferred.
 - Metadata-only scans expose inaccessible paths and changing files, never silently turn unknown into zero, and do not intentionally hydrate cloud-only files.
 - Cached results open offline without traversing the source volume; failed/cancelled refresh leaves the prior published scan intact.
 - Tree, largest-files and treemap use identical scope, metric and selection semantics.
@@ -40,7 +44,7 @@ The minimalist case wins the first milestone: tree and largest files with instan
 - Changes never treats coverage failures as deletions and reports source intervals rather than claiming atomic filesystem snapshots.
 
 ## Risks and decisions
-Prerequisite G0 is the platform/dependency spike; failure blocks feature implementation until an acceptable solution is demonstrated. Signing credentials and native test machines are release prerequisites, not reasons to substitute compile-only evidence. Exact minimum OS/GPU versions and Linux libc baseline are selected and recorded by G0. Default initial architecture proposal: Windows x86_64, macOS arm64 and x86_64, Linux x86_64; additional ARM64 targets deferred. This matrix is a proposal to validate, not a claim of existing support. General OS support remains required even if the initial architecture matrix is narrowed by an explicit user decision.
+Prerequisite G0 is the platform/dependency spike; failure blocks feature implementation until an acceptable solution is demonstrated. Signing credentials remain a distribution consideration; native test machines are deferred. CI is accepted for current development progression, without claiming runtime evidence. Exact minimum OS/GPU versions and Linux libc baseline are selected and recorded by G0. Default initial architecture proposal: Windows x86_64, macOS arm64 and x86_64, Linux x86_64; additional ARM64 targets deferred. This matrix is a proposal to validate, not a claim of existing support. General OS support remains required even if the initial architecture matrix is narrowed by an explicit user decision.
 
 No unresolved user application-context decisions remain. No existing compatibility promise requires preservation. Do not change the operating context during implementation without asking Matt. Scope changes, privileged execution and deletion are not authorized by this plan.
 
