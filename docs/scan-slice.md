@@ -12,7 +12,7 @@ are read, uploaded or deleted by scanning. Temporary fixture tests own their dat
   scan remains published if cancellation arrives afterward.
 - Independent read-only SQLite connection for cached navigation during writer work.
   Only published roots are navigable; previous snapshots remain pinned while viewed.
-- Native-name-ordered folder pages and whole-scan size-ordered largest regular files.
+- Size-ordered folder pages and root/subtree largest regular files.
   Pages are bounded to 100 rows; rendered rows use GPUI virtualization. Logical and
   allocated totals distinguish observed bytes, unknown values and coverage gaps.
 - Immutable per-scan root path and identity, traversal interval, retained old cache,
@@ -22,8 +22,14 @@ are read, uploaded or deleted by scanning. Temporary fixture tests own their dat
 
 ## Known limitations and conservative policies
 
-- Treemap, size-sorted folder view, subtree-largest, name/time/size filters, Changes,
-  root alias/removal controls and detailed issue inspection are not implemented.
+- Bounded treemaps, explicit filters, mounted-target selection, cached diagnostics,
+  hardlink alias choice and confirmed cache-only removal are integrated. Changes
+  comparison and root relinking remain unfinished. New controls await native CI.
+- Filters retain the previous view while their separate worker computes results.
+  Empty filters use indexed base queries directly. Pages contain at most 100 rows;
+  treemap Other includes all omitted weight and opens the full paged child scope.
+- Windows traversal currently fails native CI at directory ReOpenFile (OS error 87).
+  This is an open implementation blocker, not a passing platform claim.
 - No root path component may be a symlink/reparse redirect. On macOS, explicitly
   select the canonical location instead of an alias such as `/tmp` or `/var`.
 - Linux requires statx mount IDs under the default policy and allows only known
@@ -53,3 +59,12 @@ cache size 582,737,920 bytes. The host reported Xeon 8573C, 10 GB RAM and glibc
 2.41; this warm OS-cache measurement is not the planned 16 GB SSD reference
 machine, cold-cache or UI performance result. Run the ignored store benchmark
 with `cargo test -p space-store --release million_entry_fixture -- --ignored --nocapture`.
+
+## Filter query measurements
+
+An optimized one-million-file full-match filter took 10.270 seconds in the same
+cloud Linux environment; no-op filtering took 0.450 ms. Filtered top-100 warm p95
+was 6.741 ms, with 32,456 KiB peak RSS. A prior equivalent warm run measured
+child-summary computation at 49.93 ms.
+These are development measurements, not cold-cache or reference-hardware gates.
+Filter Apply is explicit and cancellation preserves the previous displayed view.

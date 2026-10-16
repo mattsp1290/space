@@ -58,15 +58,7 @@ fn open_root_with_policy(path: &Path, policy: Option<&ScanPolicy>) -> io::Result
         match component {
             Component::Prefix(prefix) => {
                 #[cfg(windows)]
-                if !matches!(
-                    prefix.kind(),
-                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
-                ) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "Network and device roots are unsupported",
-                    ));
-                }
+                platform::validate_root_prefix(prefix.kind())?;
                 anchor.push(prefix.as_os_str());
             }
             Component::RootDir => anchor.push(component.as_os_str()),
@@ -670,3 +662,8 @@ fn finish_scan(
 
 #[cfg(test)]
 mod tests;
+
+mod volumes;
+pub use volumes::{
+    MountedVolume, VolumeCapacity, VolumeIssue, VolumeListing, enumerate_volumes, volume_capacity,
+};

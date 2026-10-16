@@ -10,6 +10,16 @@ concurrency:
   group: native-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  windows-headless:
+    name: Windows scanner and store fast tests
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Native metadata and persistence regressions
+        run: cargo test -p space-core -p space-scan -p space-store --locked --no-fail-fast -- --nocapture
   native:
     name: ${{ matrix.target }}
     strategy:

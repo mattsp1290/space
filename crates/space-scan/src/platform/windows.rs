@@ -10,8 +10,9 @@ use super::*;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{OpenOptions, OpenOptionsExt};
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::path::{Component, Path, PathBuf, Prefix};
 use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
@@ -19,8 +20,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_OPEN_NO_RECALL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO,
     FILE_LIST_DIRECTORY, FILE_NAME_OPENED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
     FILE_STANDARD_INFO, FileAttributeTagInfo, FileIdBothDirectoryInfo,
-    FileIdBothDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
-    GetFinalPathNameByHandleW, ReOpenFile, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
+    FileIdBothDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetDiskFreeSpaceExW,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeNameForVolumeMountPointW,
+    ReOpenFile, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
 };
 use windows_sys::Win32::System::SystemServices::{
     IO_REPARSE_TAG_CLOUD, IO_REPARSE_TAG_CLOUD_MASK, IO_REPARSE_TAG_FILE_PLACEHOLDER,
@@ -67,16 +69,55 @@ pub(crate) fn open_child(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
     Ok(Dir::from_std_file(file))
 }
 
-pub(crate) fn open_anchor(path: &std::path::Path) -> io::Result<Dir> {
+/// Permit drive prefixes and the exact volume GUID namespace, never arbitrary
+/// device paths, UNC shares, or other verbatim namespaces.
+pub(crate) fn validate_root_prefix(prefix: Prefix<'_>) -> io::Result<()> {
+    if matches!(prefix, Prefix::Disk(_) | Prefix::VerbatimDisk(_)) {
+        return Ok(());
+    }
+    if let Prefix::Verbatim(name) = prefix {
+        // Limit collection even for an untrusted, arbitrarily long prefix.
+        let root: Vec<u16> = br"\\?\"
+            .iter()
+            .copied()
+            .map(u16::from)
+            .chain(name.encode_wide())
+            .chain(std::iter::once(u16::from(b'\\')))
+            .take(50)
+            .collect();
+        if root.len() == 49 && volume_guid_root(&root).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows scan roots require a drive or an exact volume GUID prefix",
+    ))
+}
+
+pub(crate) fn open_anchor(path: &Path) -> io::Result<Dir> {
     use std::os::windows::fs::OpenOptionsExt as _;
-    use std::path::{Component, Prefix};
     let mut components = path.components();
-    let drive = matches!(components.next(), Some(Component::Prefix(prefix))
-        if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)));
-    if !drive || components.next() != Some(Component::RootDir) || components.next().is_some() {
+    let Some(Component::Prefix(prefix)) = components.next() else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Windows scan anchor must be an absolute drive root",
+            "Windows scan anchor requires an absolute root",
+        ));
+    };
+    validate_root_prefix(prefix.kind())?;
+    if matches!(prefix.kind(), Prefix::Verbatim(_)) {
+        let root: Vec<u16> = path.as_os_str().encode_wide().take(50).collect();
+        if root.len() != 49 || volume_guid_root(&root).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows volume GUID anchor must end at the root backslash",
+            ));
+        }
+    }
+    if components.next() != Some(Component::RootDir) || components.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows scan anchor must be a drive root or volume GUID root",
         ));
     }
     let file = std::fs::OpenOptions::new()
@@ -88,6 +129,75 @@ pub(crate) fn open_anchor(path: &std::path::Path) -> io::Result<Dir> {
         .open(path)?;
     require_directory(observation(&file)?)?;
     Ok(Dir::from_std_file(file))
+}
+
+/// Resolve an OS-advertised mount point to its volume GUID root. Subsequent
+/// opens use that root rather than traversing the mount alias or its contents.
+pub(crate) fn mounted_volume_root(path: &Path) -> io::Result<PathBuf> {
+    const MAX_PATH_UNITS: usize = 65_536;
+    let invalid_input = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Mounted volume path must be bounded, absolute, and free of parent components or NUL",
+        )
+    };
+    let mut mount: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .take(MAX_PATH_UNITS)
+        .collect();
+    let needs_slash = mount.last() != Some(&u16::from(b'\\'));
+    if mount.contains(&0)
+        || mount
+            .len()
+            .checked_add(usize::from(needs_slash) + 1)
+            .is_none_or(|length| length > MAX_PATH_UNITS)
+    {
+        return Err(invalid_input());
+    }
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Err(invalid_input());
+    };
+    validate_root_prefix(prefix.kind())?;
+    if components.next() != Some(Component::RootDir) {
+        return Err(invalid_input());
+    }
+    for component in components {
+        match component {
+            Component::Normal(name) => {
+                NativeName::from_os(name).map_err(|_| invalid_input())?;
+            }
+            Component::CurDir => {}
+            _ => return Err(invalid_input()),
+        }
+    }
+    if needs_slash {
+        mount.push(u16::from(b'\\'));
+    }
+    mount.push(0);
+    let mut volume = [0_u16; 50];
+    // SAFETY: mount is a bounded, initialized native path ending in backslash
+    // and NUL, with no interior NUL. volume is initialized and writable for the
+    // exact advertised 50 UTF-16 units, including the GUID root's terminator.
+    // The synchronous SDK query retains no pointers and neither reads file
+    // contents nor changes mount points, security settings, or privileges.
+    let success = unsafe {
+        GetVolumeNameForVolumeMountPointW(mount.as_ptr(), volume.as_mut_ptr(), volume.len() as u32)
+    };
+    if success == 0 {
+        return Err(sdk_error("GetVolumeNameForVolumeMountPointW"));
+    }
+    let length = volume.iter().position(|&unit| unit == 0);
+    if length != Some(49) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows returned an invalid mounted volume root length",
+        ));
+    }
+    let root = &volume[..49];
+    volume_guid_root(root)?;
+    Ok(PathBuf::from(OsString::from_wide(root)))
 }
 
 // Microsoft requires an eight-byte-aligned directory information buffer. Keeping
@@ -591,6 +701,75 @@ fn final_path(handle: BorrowedHandle<'_>, volume_flag: u32) -> io::Result<Vec<u1
     }
 }
 
+/// Returns (account-visible total bytes, account-available free bytes).
+/// The caller has already validated the directory and its filesystem locality.
+pub(crate) fn volume_capacity_bytes(dir: &Dir) -> io::Result<(u64, u64)> {
+    let root = volume_guid_root(&final_path(dir.as_handle(), VOLUME_NAME_GUID)?)?;
+    let mut total = 0_u64;
+    let mut available = 0_u64;
+    // SAFETY: root is an initialized, NUL-terminated UTF-16 volume GUID root
+    // extracted from this live directory handle, never an ambient mount alias.
+    // Both outputs are initialized, aligned u64 values, valid for this synchronous
+    // call. The unused volume-wide free-space output is explicitly null. The API
+    // retains no pointers, reads no file contents, and changes no volume state.
+    let success = unsafe {
+        GetDiskFreeSpaceExW(
+            root.as_ptr(),
+            &mut available,
+            &mut total,
+            std::ptr::null_mut(),
+        )
+    };
+    if success == 0 {
+        return Err(sdk_error("GetDiskFreeSpaceExW(volume GUID root)"));
+    }
+    if available > total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows account-available capacity exceeds its total capacity",
+        ));
+    }
+    Ok((total, available))
+}
+
+// A volume GUID root has exactly 49 native units, plus its required terminator.
+// Validate its complete grammar before passing it to another path-based API.
+fn volume_guid_root(path: &[u16]) -> io::Result<[u16; 50]> {
+    const PREFIX: &[u8] = br"\\?\Volume{";
+    const GUID_UNITS: usize = 36;
+    const ROOT_UNITS: usize = PREFIX.len() + GUID_UNITS + 2;
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows returned a malformed volume GUID path",
+        )
+    };
+    let root = path.get(..ROOT_UNITS).ok_or_else(invalid)?;
+    if !starts_with_ascii_ignore_case(root, PREFIX)
+        || path.contains(&0)
+        || root[ROOT_UNITS - 2] != u16::from(b'}')
+        || root[ROOT_UNITS - 1] != u16::from(b'\\')
+    {
+        return Err(invalid());
+    }
+    for (index, &unit) in root[PREFIX.len()..PREFIX.len() + GUID_UNITS]
+        .iter()
+        .enumerate()
+    {
+        let valid = if matches!(index, 8 | 13 | 18 | 23) {
+            unit == u16::from(b'-')
+        } else {
+            u8::try_from(unit).is_ok_and(|byte| byte.is_ascii_hexdigit())
+        };
+        if !valid {
+            return Err(invalid());
+        }
+    }
+    let mut terminated = [0_u16; 50];
+    terminated[..ROOT_UNITS].copy_from_slice(root);
+    Ok(terminated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +802,160 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn root_prefixes_allow_only_drives_and_strict_volume_guids() {
+        assert!(validate_root_prefix(Prefix::Disk(b'C')).is_ok());
+        assert!(validate_root_prefix(Prefix::VerbatimDisk(b'C')).is_ok());
+        for name in [
+            "Volume{01234567-89ab-cdef-0123-456789abcdef}",
+            "vOlUmE{01234567-89AB-CDEF-0123-456789ABCDEF}",
+        ] {
+            assert!(validate_root_prefix(Prefix::Verbatim(OsStr::new(name))).is_ok());
+        }
+        for name in [
+            "Volume{01234567-89ab-cdef-0123-456789abcdef}suffix",
+            "Volume{01234567-89ab-cdef-0123-456789abcdeg}",
+            "Volume{01234567-89ab-cdef-0123-456789abcdef}\\child",
+            "Volume{01234567-89ab-cdef-0123-456789abcdef}\\",
+            "GLOBALROOT",
+            "PhysicalDrive0",
+            "PIPE",
+            "C:",
+            "",
+        ] {
+            assert!(validate_root_prefix(Prefix::Verbatim(OsStr::new(name))).is_err());
+        }
+        for prefix in [
+            Prefix::DeviceNS(OsStr::new("PhysicalDrive0")),
+            Prefix::UNC(OsStr::new("server"), OsStr::new("share")),
+            Prefix::VerbatimUNC(OsStr::new("server"), OsStr::new("share")),
+        ] {
+            assert!(validate_root_prefix(prefix).is_err());
+        }
+    }
+
+    #[test]
+    fn mounted_volume_lookup_rejects_invalid_inputs_before_sdk_query() {
+        for path in [
+            "relative",
+            "C:relative",
+            "C:\\parent\\..\\root",
+            "C:\\root\0tail",
+            "\\\\.\\PhysicalDrive0",
+            "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\",
+        ] {
+            let error = mounted_volume_root(Path::new(path)).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ));
+        }
+        let overlong = format!("C:\\{}", "a".repeat(65_536));
+        assert_eq!(
+            mounted_volume_root(Path::new(&overlong))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        for path in [
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\child",
+        ] {
+            assert_eq!(
+                open_anchor(Path::new(path)).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn native_mounted_drive_resolves_to_same_guid_root_identity() {
+        let fixture = Fixture::new();
+        let drive_root = fixture.0.ancestors().last().unwrap();
+        let guid_root = mounted_volume_root(drive_root).unwrap();
+        let native: Vec<u16> = guid_root.as_os_str().encode_wide().collect();
+        assert_eq!(native.len(), 49);
+        volume_guid_root(&native).unwrap();
+        let drive = open_anchor(drive_root).unwrap();
+        let guid = open_anchor(&guid_root).unwrap();
+        assert_eq!(
+            directory(&drive).unwrap().identity,
+            directory(&guid).unwrap().identity
+        );
+        assert_eq!(mounted_volume_root(&guid_root).unwrap(), guid_root);
+    }
+
+    #[test]
+    fn native_mounted_volume_lookup_refuses_unregistered_directories() {
+        let fixture = Fixture::new();
+        assert!(mounted_volume_root(&fixture.0).is_err());
+        assert!(mounted_volume_root(&fixture.0.join("missing")).is_err());
+    }
+
+    #[test]
+    fn volume_guid_root_is_bounded_terminated_and_preserves_native_units() {
+        for root in [
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+            r"\\?\vOlUmE{01234567-89AB-CDEF-0123-456789ABCDEF}\",
+        ] {
+            let root: Vec<u16> = root.encode_utf16().collect();
+            let mut expected = root.clone();
+            expected.push(0);
+            assert_eq!(volume_guid_root(&root).unwrap().as_slice(), expected);
+            let mut path = root;
+            // Unpaired surrogates in native descendants need no lossy decoding.
+            path.extend([b'a' as u16, 0xd800, b'\\' as u16, b'b' as u16]);
+            assert_eq!(volume_guid_root(&path).unwrap().as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn volume_guid_root_rejects_malformed_or_non_guid_paths() {
+        let valid: Vec<u16> = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\"
+            .encode_utf16()
+            .collect();
+        for length in 0..valid.len() {
+            assert!(volume_guid_root(&valid[..length]).is_err());
+        }
+        for index in 0..valid.len() {
+            let mut invalid = valid.clone();
+            invalid[index] = u16::from(b'!');
+            assert!(volume_guid_root(&invalid).is_err());
+        }
+        for path in [
+            r"C:\root",
+            r"\\?\C:\root",
+            r"\\?\UNC\server\share\root",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}suffix\",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}/root",
+            "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\root\0tail",
+        ] {
+            let error = volume_guid_root(&path.encode_utf16().collect::<Vec<_>>()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+        for unit in [0_u16, 0x0100, 0xd800, 0xff10] {
+            let mut invalid = valid.clone();
+            invalid[11] = unit;
+            assert!(volume_guid_root(&invalid).is_err());
+        }
+        for (index, byte) in [(11, b'-'), (11, b'g'), (19, b'0'), (47, b')'), (48, b'/')] {
+            let mut invalid = valid.clone();
+            invalid[index] = u16::from(byte);
+            assert!(volume_guid_root(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn native_volume_capacity_is_nonzero_and_account_bounded() {
+        let fixture = Fixture::new();
+        let root = fixture.dir();
+        directory(&root).unwrap();
+        boundary(&root, &ScanPolicy::default()).unwrap();
+        let (total, available) = volume_capacity_bytes(&root).unwrap();
+        assert!(total > 0);
+        assert!(available <= total);
     }
 
     #[test]

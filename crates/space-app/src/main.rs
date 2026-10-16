@@ -1,6 +1,11 @@
 mod backend;
+mod cache_management;
+mod deferred;
+mod filters;
 mod intent;
 mod paths;
+mod text_input;
+mod treemap;
 
 use backend::{Backend, Query, Snapshot, View};
 use gpui::{
@@ -30,6 +35,19 @@ actions!(
         GoUp,
         Folders,
         Largest,
+        ShowTreemap,
+        ToggleFilters,
+        RefreshVolumes,
+        ShowCache,
+        ShowAliases,
+        NextAliases,
+        NextVolumes,
+        ToggleSubtree,
+        ResetFilters,
+        ApplyFilters,
+        CancelFilter,
+        ToggleUnknownSize,
+        ToggleUnknownTime,
         ToggleMetric,
         NextPage,
         FirstPage,
@@ -61,13 +79,26 @@ impl Drop for Running {
     }
 }
 
+type FilterSession = deferred::Deferred<backend::Filtered>;
 struct Space {
+    executor: gpui::BackgroundExecutor,
+    filters_visible: bool,
+    cache_visible: bool,
+    cache_model: cache_management::Model,
+    cache_before: Option<space_core::ScanId>,
+    cache_epoch: u64,
+    maintenance_busy: bool,
+    volumes: Option<space_scan::VolumeListing>,
+    volume_busy: bool,
+    volume_page: usize,
+    volumes_visible: bool,
     focus: FocusHandle,
     list_focus: FocusHandle,
     scroll: UniformListScrollHandle,
     backend: Option<Backend>,
     cache_directory: Option<PathBuf>,
     snapshot: Option<Arc<Snapshot>>,
+    pending_snapshot: Option<Arc<Snapshot>>,
     roots: Vec<RootRecord>,
     intent: intent::Intent,
     picker_open: bool,
@@ -77,8 +108,17 @@ struct Space {
     scan_status: String,
     view: View,
     metric: Metric,
+    applied_metric: Metric,
+    applied_filter: space_store::QueryFilter,
     breadcrumbs: Vec<(NodeId, String)>,
     rows: Vec<StoredEntry>,
+    row_paths: Vec<String>,
+    alias_nodes: Vec<(NodeId, String)>,
+    alias_origin: Option<NodeId>,
+    alias_next: Option<PageCursor>,
+    alias_selected: Option<NodeId>,
+    alias_busy: bool,
+    alias_generation: u64,
     selected: usize,
     next_page: Option<PageCursor>,
     query_generation: u64,
@@ -86,6 +126,152 @@ struct Space {
     pending_query: Option<(u64, Query)>,
     snapshot_request: u64,
     root_busy: bool,
+    filter_inputs: Vec<gpui::Entity<text_input::TextInput>>,
+    filter_subscriptions: Vec<gpui::Subscription>,
+    filter_config: space_store::QueryFilter,
+    draft_unknown_size: bool,
+    draft_unknown_time: bool,
+    filter_session: Option<FilterSession>,
+    filter_epoch: u64,
+    filter_busy: bool,
+    filter_pending: Option<(u64, space_store::QueryFilter)>,
+    filter_cancel: Option<Cancellation>,
+    filter_status: String,
+    filter_error: Option<String>,
+    subtree_only: bool,
+    treemap: treemap::Model,
+    current_totals: Option<StoredEntry>,
+    chart_selected: Option<NodeId>,
+}
+
+impl Drop for Space {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending_query.take() {
+            self.executor
+                .spawn(async move {
+                    drop(pending);
+                })
+                .detach();
+        }
+        if let Some(cancel) = self.filter_cancel.take() {
+            self.executor
+                .spawn(async move {
+                    cancel.cancel();
+                })
+                .detach();
+        }
+    }
+}
+
+fn reset_empty_presentation(
+    next: &mut Option<PageCursor>,
+    selected: &mut usize,
+    filter: &mut space_store::QueryFilter,
+    status: &mut String,
+) {
+    *next = None;
+    *selected = 0;
+    *filter = space_store::QueryFilter::default();
+    *status = "No cached scan is displayed.".into();
+}
+
+fn clear_chart(model: &mut treemap::Model, selected: &mut Option<NodeId>) {
+    *model = treemap::Model::default();
+    *selected = None;
+}
+fn alias_selection_is_current(
+    rendered: (u64, Option<space_core::ScanId>),
+    current: (u64, Option<space_core::ScanId>),
+    node: NodeId,
+    entries: &[(NodeId, String)],
+) -> bool {
+    rendered == current && current.1.is_some() && entries.iter().any(|(id, _)| *id == node)
+}
+fn chart_folder(model: &treemap::Model, node: NodeId) -> Option<String> {
+    model
+        .items
+        .iter()
+        .find(|item| item.node == node && item.is_directory)
+        .map(|item| item.label.clone())
+}
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    #[test]
+    fn stale_alias_click_cannot_target_another_scan_or_selection() {
+        let node = NodeId::try_from(1).unwrap();
+        let a = space_core::ScanId::try_from(1).unwrap();
+        let b = space_core::ScanId::try_from(2).unwrap();
+        let rows = [(node, "alias".into())];
+        assert!(alias_selection_is_current(
+            (1, Some(a)),
+            (1, Some(a)),
+            node,
+            &rows
+        ));
+        assert!(!alias_selection_is_current(
+            (1, Some(a)),
+            (2, Some(a)),
+            node,
+            &rows
+        ));
+        assert!(!alias_selection_is_current(
+            (1, Some(a)),
+            (1, Some(b)),
+            node,
+            &rows
+        ));
+        assert!(!alias_selection_is_current(
+            (1, Some(a)),
+            (1, Some(a)),
+            node,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn empty_reload_clears_applied_counts_pages_and_selection() {
+        let mut next = Some(PageCursor {
+            ordinal: 42,
+            value: 100,
+        });
+        let mut selected = 9;
+        let mut filter = space_store::QueryFilter {
+            name: Some("old".into()),
+            ..Default::default()
+        };
+        let mut status = "Filtered: 99 matches, 12345 bytes".into();
+        reset_empty_presentation(&mut next, &mut selected, &mut filter, &mut status);
+        assert!(next.is_none());
+        assert_eq!(selected, 0);
+        assert!(filter.is_empty());
+        assert_eq!(status, "No cached scan is displayed.");
+    }
+    #[test]
+    fn old_sibling_chart_event_is_rejected_while_next_scope_loads() {
+        let a = NodeId::try_from(1).unwrap();
+        let b = NodeId::try_from(2).unwrap();
+        let mut model = treemap::Model {
+            items: [(a, "A"), (b, "B")]
+                .into_iter()
+                .map(|(node, label)| treemap::Item {
+                    node,
+                    label: label.into(),
+                    detail: String::new(),
+                    bytes: 1,
+                    unknown_count: 0,
+                    is_directory: true,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(chart_folder(&model, a).as_deref(), Some("A"));
+        let mut selected = Some(a);
+        clear_chart(&mut model, &mut selected);
+        assert!(chart_folder(&model, b).is_none());
+        assert!(model.items.is_empty());
+        assert!(selected.is_none());
+    }
 }
 
 fn control(id: &'static str, label: &'static str) -> Stateful<Div> {
@@ -124,12 +310,24 @@ impl Space {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let mut app = Self {
+            executor: cx.background_executor().clone(),
+            filters_visible: false,
+            cache_visible: false,
+            cache_model: cache_management::Model::default(),
+            cache_before: None,
+            cache_epoch: 0,
+            maintenance_busy: false,
+            volumes: None,
+            volume_busy: false,
+            volume_page: 0,
+            volumes_visible: false,
             focus,
             list_focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             backend: None,
             cache_directory: None,
             snapshot: None,
+            pending_snapshot: None,
             roots: vec![],
             intent: intent::Intent::default(),
             picker_open: false,
@@ -139,8 +337,17 @@ impl Space {
             scan_status: "No scan running.".into(),
             view: View::Folders,
             metric: Metric::Logical,
+            applied_metric: Metric::Logical,
+            applied_filter: space_store::QueryFilter::default(),
             breadcrumbs: vec![],
             rows: vec![],
+            row_paths: vec![],
+            alias_nodes: vec![],
+            alias_origin: None,
+            alias_next: None,
+            alias_selected: None,
+            alias_busy: false,
+            alias_generation: 0,
             selected: 0,
             next_page: None,
             query_generation: 0,
@@ -148,9 +355,344 @@ impl Space {
             pending_query: None,
             snapshot_request: 0,
             root_busy: false,
+            filter_inputs: [
+                ("Name contains", "literal text"),
+                ("Path contains", "relative display path"),
+                ("Extension", "e.g. rs"),
+                ("Minimum bytes", "0"),
+                ("Maximum bytes", "unbounded"),
+                ("Modified from UTC", "YYYY-MM-DD / RFC3339"),
+                ("Modified through UTC", "YYYY-MM-DD / RFC3339"),
+            ]
+            .into_iter()
+            .map(|(label, placeholder)| {
+                cx.new(|cx| text_input::TextInput::new(label, placeholder, cx))
+            })
+            .collect(),
+            filter_subscriptions: vec![],
+            filter_config: space_store::QueryFilter::default(),
+            draft_unknown_size: false,
+            draft_unknown_time: false,
+            filter_session: None,
+            filter_epoch: 0,
+            filter_busy: false,
+            filter_pending: None,
+            filter_cancel: None,
+            filter_status: "Unfiltered totals".into(),
+            filter_error: None,
+            subtree_only: true,
+            treemap: treemap::Model::default(),
+            current_totals: None,
+            chart_selected: None,
         };
+        app.filter_subscriptions = app
+            .filter_inputs
+            .iter()
+            .map(|input| {
+                cx.subscribe(input, |this, _, event, cx| {
+                    let text_input::TextInputEvent::Edited(value) = event;
+                    let _ = value;
+                    this.debounce_filters(cx);
+                })
+            })
+            .collect();
         app.initialize(cx);
+        app.load_volumes(cx);
         app
+    }
+    fn show_aliases(&mut self, _: &ShowAliases, _: &mut Window, cx: &mut Context<Self>) {
+        let node = if self.view == View::Treemap {
+            self.chart_selected
+        } else {
+            self.rows.get(self.selected).map(|r| r.entry.node)
+        };
+        if let Some(node) = node {
+            self.load_aliases(node, None, cx);
+        }
+    }
+    fn next_aliases(&mut self, _: &NextAliases, _: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(node), Some(cursor)) = (self.alias_origin, self.alias_next) {
+            self.load_aliases(node, Some(cursor), cx);
+        }
+    }
+    fn load_aliases(&mut self, node: NodeId, cursor: Option<PageCursor>, cx: &mut Context<Self>) {
+        if self.alias_busy || self.maintenance_busy {
+            return;
+        }
+        let (Some(backend), Some(snapshot)) = (self.backend.clone(), self.snapshot.clone()) else {
+            return;
+        };
+        self.alias_busy = true;
+        let generation = self.query_generation;
+        let alias_generation = self.alias_generation;
+        let task = cx.background_executor().spawn(async move {
+            let _pin = &snapshot;
+            backend::aliases(&backend, snapshot.scan, node, cursor)
+        });
+        cx.spawn(async move |this,cx|{let result=task.await;let _=this.update(cx,|this,cx|{
+            this.alias_busy=false;
+            if this.query_generation==generation && this.alias_generation==alias_generation {
+                match result {Ok(page)=>{this.alias_origin=Some(node);this.alias_nodes=page.entries;this.alias_next=page.next;this.alias_selected=None;this.status="Choose a cached alias, then Copy or Reveal. Filter-independent aliases share one identity; only the canonical owner is charged.".into();},Err(error)=>this.status=format!("Aliases unavailable: {error}")}
+            }cx.notify();
+        });}).detach();
+        cx.notify();
+    }
+    fn clear_aliases(&mut self) {
+        self.alias_generation = self.alias_generation.wrapping_add(1);
+        self.alias_nodes.clear();
+        self.alias_origin = None;
+        self.alias_next = None;
+        self.alias_selected = None;
+    }
+    fn clear_empty_view(&mut self) {
+        self.snapshot = None;
+        self.pending_snapshot = None;
+        self.filter_session = None;
+        self.rows.clear();
+        self.row_paths.clear();
+        self.breadcrumbs.clear();
+        self.current_totals = None;
+        clear_chart(&mut self.treemap, &mut self.chart_selected);
+        self.clear_aliases();
+        reset_empty_presentation(
+            &mut self.next_page,
+            &mut self.selected,
+            &mut self.applied_filter,
+            &mut self.filter_status,
+        );
+        self.applied_metric = self.metric;
+    }
+    fn show_cache(&mut self, _: &ShowCache, _: &mut Window, cx: &mut Context<Self>) {
+        self.cache_visible = !self.cache_visible;
+        if self.cache_visible {
+            self.load_cache_panel(None, self.snapshot.as_ref().map(|s| s.scan), None, cx);
+        }
+        cx.notify();
+    }
+    fn load_cache_panel(
+        &mut self,
+        before: Option<space_core::ScanId>,
+        selected: Option<space_core::ScanId>,
+        after: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cache_model.busy || self.maintenance_busy {
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        self.cache_model.busy = true;
+        self.cache_epoch += 1;
+        let epoch = self.cache_epoch;
+        self.cache_before = before;
+        let task = cx
+            .background_executor()
+            .spawn(async move { backend::inspect_cache(&backend, before, selected, after) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.cache_epoch != epoch {
+                    return;
+                }
+                this.cache_model.busy = false;
+                match result {
+                    Ok(data) => {
+                        this.cache_model.error = None;
+                        this.cache_model.rows = data
+                            .rows
+                            .into_iter()
+                            .map(|row| cache_management::Row {
+                                scan: row.info.spec.key.id,
+                                root: row
+                                    .path
+                                    .to_path_buf()
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| "Foreign native path".into()),
+                                status: format!("{:?}", row.info.status),
+                                coverage: row
+                                    .info
+                                    .coverage
+                                    .map(|c| {
+                                        format!(
+                                            "{} errors, {} unknown, {} excluded, {} boundaries",
+                                            c.error_count,
+                                            c.unknown_entries,
+                                            c.excluded_scopes,
+                                            c.boundary_scopes
+                                        )
+                                    })
+                                    .unwrap_or_else(|| "Unpublished observation".into()),
+                                started: format!("{} UTC-seconds", row.info.started.seconds),
+                                ended: row
+                                    .info
+                                    .ended
+                                    .map(|t| format!("{} UTC-seconds", t.seconds))
+                                    .unwrap_or_else(|| "unfinished".into()),
+                                sizes: row
+                                    .totals
+                                    .map(|t| {
+                                        format!(
+                                            "logical {} · allocated {}",
+                                            total_text(&t, Metric::Logical),
+                                            total_text(&t, Metric::Allocated)
+                                        )
+                                    })
+                                    .unwrap_or_default(),
+                                removable: !matches!(
+                                    row.info.status,
+                                    space_core::ScanStatus::Scanning
+                                        | space_core::ScanStatus::Finalizing
+                                ),
+                            })
+                            .collect();
+                        this.cache_model.selected = selected
+                            .filter(|id| this.cache_model.rows.iter().any(|r| r.scan == *id));
+                        this.cache_model.next = data.next;
+                        this.cache_model.footprint = Some(data.footprint);
+                        this.cache_model.diagnostics = data
+                            .issues
+                            .as_ref()
+                            .map(|page| {
+                                page.issues
+                                    .iter()
+                                    .map(|issue| {
+                                        format!(
+                                            "{:?} · node {:?} · {} · {}",
+                                            issue.class,
+                                            issue.node,
+                                            issue
+                                                .name
+                                                .as_ref()
+                                                .map(|n| n.display())
+                                                .unwrap_or_default(),
+                                            issue.detail
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        this.cache_model.diagnostic_next = data.issues.and_then(|page| page.next);
+                    }
+                    Err(error) => this.cache_model.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn cache_event(
+        &mut self,
+        event: cache_management::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.cache_model.allows(event) || self.maintenance_busy {
+            return;
+        }
+        use cache_management::Event;
+        match event {
+            Event::Select(scan) => self.load_cache_panel(self.cache_before, Some(scan), None, cx),
+            Event::FirstPage | Event::RefreshRequested => {
+                self.load_cache_panel(None, None, None, cx)
+            }
+            Event::NextPage(before) => self.load_cache_panel(Some(before), None, None, cx),
+            Event::MoreDiagnostics(after) => self.load_cache_panel(
+                self.cache_before,
+                self.cache_model.selected,
+                Some(after),
+                cx,
+            ),
+            Event::RemoveRequested(scan) => self.confirm_cache_removal(Some(scan), window, cx),
+            Event::ClearRequested => self.confirm_cache_removal(None, window, cx),
+        }
+    }
+    fn cache_idle(&self) -> bool {
+        self.running.is_none()
+            && !self.filter_busy
+            && !self.query_busy
+            && !self.intent.path_busy
+            && !self.root_busy
+            && !self.alias_busy
+    }
+    fn confirm_cache_removal(
+        &mut self,
+        scan: Option<space_core::ScanId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.cache_idle() {
+            self.cache_model.warning = Some(
+                "Wait for current scan, filter and view operations before removing cached data."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        let epoch = self.cache_epoch;
+        let snapshot_request = self.snapshot_request;
+        self.maintenance_busy = true;
+        self.cache_model.busy = true;
+        let title = scan
+            .map(|id| format!("Remove cached scan {}?", id.get()))
+            .unwrap_or_else(|| "Clear all cached scan metadata?".into());
+        let response=window.prompt(gpui::PromptLevel::Warning,&title,Some("This removes only Space's local cached metadata, never source files. There is no undo; recovery requires rescanning. Current views will close and the latest remaining scan will reopen."),&["Cancel","Remove cached metadata"],cx);
+        cx.spawn(async move |this,cx| {let response=response.await;let _=this.update(cx,|this,cx| {
+            this.maintenance_busy=false;this.cache_model.busy=false;
+            if !matches!(response,Ok(1)) {cx.notify();return;}
+            let event=scan.map(cache_management::Event::RemoveRequested).unwrap_or(cache_management::Event::ClearRequested);
+            if this.cache_epoch!=epoch || this.snapshot_request!=snapshot_request || !this.cache_idle() || !this.cache_model.allows(event) {
+                this.cache_model.warning=Some("Cache selection or active work changed. Nothing removed; review and confirm again.".into());cx.notify();return;
+            }
+            this.maintenance_busy=true;this.cache_model.busy=true;
+            this.query_generation+=1;let pending_query=this.pending_query.take();this.filter_epoch+=1;this.filter_pending=None;
+            let snapshot=this.snapshot.take();let pending=this.pending_snapshot.take();
+            let filtered=this.filter_session.take();
+            this.rows.clear();this.row_paths.clear();this.clear_aliases();this.breadcrumbs.clear();clear_chart(&mut this.treemap,&mut this.chart_selected);this.current_totals=None;
+            let task=cx.background_executor().spawn(async move {
+                if let Some((_,query))=pending_query {if let Some(filtered)=query.filtered{filtered.close_on_worker();}}
+                drop(snapshot);drop(pending);if let Some(filtered)=filtered{filtered.close_on_worker();}
+                let outcome=backend::remove_cached(&backend,scan);
+                let reloaded=backend::reload(&backend);
+                (outcome,reloaded)
+            });
+            cx.spawn(async move |this,cx| {let (outcome,reloaded)=task.await;let _=this.update(cx,|this,cx| {
+                this.maintenance_busy=false;this.cache_model.busy=false;
+                this.cache_model.warning=Some(match outcome {Ok(())=>"Cached metadata removed. Source files were untouched.".into(),Err(error)=>format!("Cache removal failed: {error}")});
+                match reloaded {Ok(state)=>{this.roots=state.roots;if let Some(snapshot)=state.snapshot{this.apply_snapshot(snapshot,cx);}else{this.clear_empty_view();}},Err(error)=>this.status=format!("Cache reload failed: {error}")}
+                this.load_cache_panel(None,None,None,cx);cx.notify();
+            });}).detach();cx.notify();
+        });}).detach();
+        cx.notify();
+    }
+    fn load_volumes(&mut self, cx: &mut Context<Self>) {
+        if self.volume_busy {
+            return;
+        }
+        self.volume_busy = true;
+        let task = cx
+            .background_executor()
+            .spawn(async { space_scan::enumerate_volumes() });
+        cx.spawn(async move |this,cx| {let result=task.await;let _=this.update(cx,|this,cx| {
+            this.volume_busy=false;
+            match result {Ok(listing)=>{this.volumes=Some(listing);this.volume_page=0;},Err(error)=>this.status=format!("Volume discovery unavailable: {error}. Choose Folder remains available.")}
+            cx.notify();
+        });}).detach();
+        cx.notify();
+    }
+    fn refresh_volumes(&mut self, _: &RefreshVolumes, _: &mut Window, cx: &mut Context<Self>) {
+        self.load_volumes(cx);
+    }
+    fn next_volumes(&mut self, _: &NextVolumes, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(list) = &self.volumes {
+            let pages = list.volumes.len().div_ceil(8).max(1);
+            self.volume_page = (self.volume_page + 1) % pages;
+            cx.notify();
+        }
     }
     fn initialize(&mut self, cx: &mut Context<Self>) {
         let directory = match paths::cache_directory() {
@@ -180,13 +722,18 @@ impl Space {
     }
     fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
         self.snapshot_request += 1;
-        self.breadcrumbs = vec![(
-            snapshot.root_entry.entry.node,
-            snapshot.root_entry.entry.display_name.clone(),
-        )];
-        self.snapshot = Some(Arc::new(snapshot));
-        self.status = "Showing an immutable cached scan. Live root has not been revalidated; offline browsing is available.".into();
-        self.request_query(None, cx);
+        self.pending_snapshot = Some(Arc::new(snapshot));
+        self.rebuild_filters(cx);
+    }
+    fn commit_pending_snapshot(&mut self) {
+        if let Some(snapshot) = self.pending_snapshot.take() {
+            self.breadcrumbs = vec![(
+                snapshot.root_entry.entry.node,
+                snapshot.root_entry.entry.display_name.clone(),
+            )];
+            self.snapshot = Some(snapshot);
+            self.status="Showing an immutable cached scan. Live root has not been revalidated; offline browsing is available.".into();
+        }
     }
     fn choose_folder(&mut self, _: &ChooseFolder, _: &mut Window, cx: &mut Context<Self>) {
         if self.picker_open {
@@ -216,6 +763,9 @@ impl Space {
         cx.notify();
     }
     fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
+        if self.maintenance_busy {
+            return;
+        }
         if self.running.is_some() {
             self.status = "A scan is still active. Cancel it and wait for writer shutdown before starting another.".into();
             cx.notify();
@@ -306,7 +856,11 @@ impl Space {
         .detach();
         cx.notify();
     }
-    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+    fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running.is_none() && self.filter_busy {
+            self.cancel_filter(&CancelFilter, window, cx);
+            return;
+        }
         if let Some(run) = &mut self.running {
             if !run.cancel_requested {
                 run.cancel_requested = true;
@@ -321,7 +875,207 @@ impl Space {
         }
         cx.notify();
     }
+    fn toggle_filters(&mut self, _: &ToggleFilters, _: &mut Window, cx: &mut Context<Self>) {
+        self.filters_visible = !self.filters_visible;
+        cx.notify();
+    }
+    fn debounce_filters(&mut self, cx: &mut Context<Self>) {
+        self.filter_error = Some(
+            "Draft filter edits. Press Apply filters to compute; displayed results are unchanged."
+                .into(),
+        );
+        cx.notify();
+    }
+    fn apply_filters(&mut self, _: &ApplyFilters, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_filter_inputs(cx);
+    }
+    fn cancel_filter(&mut self, _: &CancelFilter, _: &mut Window, cx: &mut Context<Self>) {
+        self.filter_epoch += 1;
+        self.filter_pending = None;
+        self.pending_snapshot = None;
+        self.filter_config = self.applied_filter.clone();
+        self.metric = self.applied_metric;
+        if let Some(cancel) = self.filter_cancel.take() {
+            self.executor
+                .spawn(async move {
+                    cancel.cancel();
+                })
+                .detach();
+        }
+        self.filter_status="Filter cancelled; previous applied results retained. Draft inputs can be applied again.".into();
+        cx.notify();
+    }
+    fn apply_filter_inputs(&mut self, cx: &mut Context<Self>) {
+        if self.maintenance_busy {
+            return;
+        }
+        let values: Vec<_> = self
+            .filter_inputs
+            .iter()
+            .map(|input| input.read(cx).text().to_owned())
+            .collect();
+        let fields = filters::Fields {
+            name: values[0].clone(),
+            path: values[1].clone(),
+            extension: values[2].clone(),
+            min_size: values[3].clone(),
+            max_size: values[4].clone(),
+            modified_after: values[5].clone(),
+            modified_before: values[6].clone(),
+            include_unknown_size: self.draft_unknown_size,
+            include_unknown_time: self.draft_unknown_time,
+        };
+        match fields.apply_to(&mut self.filter_config) {
+            Ok(()) => {
+                self.filter_error = None;
+                self.rebuild_filters(cx);
+            }
+            Err(error) => {
+                self.filter_error = Some(format!(
+                    "Invalid filter: {error}. Previous applied results remain."
+                ));
+                cx.notify();
+            }
+        }
+    }
+    fn rebuild_filters(&mut self, cx: &mut Context<Self>) {
+        self.filter_epoch += 1;
+        if self.filter_busy {
+            self.filter_pending = Some((self.filter_epoch, self.filter_config.clone()));
+            if let Some(cancel) = self.filter_cancel.take() {
+                cx.background_executor()
+                    .spawn(async move {
+                        cancel.cancel();
+                    })
+                    .detach();
+            }
+            self.filter_status = "Replacing filter; waiting for cancelled query…".into();
+        } else {
+            self.start_filter(self.filter_epoch, self.filter_config.clone(), cx);
+        }
+        cx.notify();
+    }
+    fn start_filter(
+        &mut self,
+        epoch: u64,
+        config: space_store::QueryFilter,
+        cx: &mut Context<Self>,
+    ) {
+        if config.is_empty() {
+            self.commit_pending_snapshot();
+            self.filter_session = None;
+            self.applied_filter = config;
+            self.applied_metric = self.metric;
+            self.filter_status = "Unfiltered totals".into();
+            self.request_query(None, cx);
+            return;
+        }
+        let (Some(backend), Some(snapshot)) = (
+            self.backend.clone(),
+            self.pending_snapshot
+                .clone()
+                .or_else(|| self.snapshot.clone()),
+        ) else {
+            return;
+        };
+        self.filter_busy = true;
+        self.filter_status = "Computing filter… Previous applied view remains browsable. Large scans can take a minute; Cancel filter stops this query.".into();
+        let metric = self.metric;
+        let cancel = Cancellation::new();
+        self.filter_cancel = Some(cancel.clone());
+        let executor = cx.background_executor().clone();
+        let applied_config = config.clone();
+        let task = cx.background_executor().spawn(async move {
+            backend::filter(&backend, snapshot.scan, metric, &config, &cancel).map(|value| {
+                FilterSession::new(value, move |value| {
+                    executor
+                        .spawn(async move {
+                            drop(value);
+                        })
+                        .detach();
+                })
+            })
+        });
+        cx.spawn(async move |this,cx| {
+            let result = task.await;
+            let _ = this.update(cx,|this,cx| {
+                this.filter_busy = false;
+                this.filter_cancel = None;
+                if this.filter_epoch == epoch {
+                    match result {
+                        Ok(session) => {
+                            this.commit_pending_snapshot();
+                            this.applied_metric=metric;
+                            this.applied_filter=applied_config;
+                            let filtered=&session;
+                            this.filter_status=format!("Filtered: {} matching non-directory paths (aliases included) · {}. Canonical owners alone contribute bytes; coverage remains conservative.",filtered.matching_count,total_text(&filtered.root,metric));
+                            this.filter_session=Some(session);
+                            this.request_query(None,cx);
+                        }
+                        Err(error) => this.filter_status=format!("Filter failed: {error}. Previous applied view remains available."),
+                    }
+                }
+                if let Some((epoch,config))=this.filter_pending.take() {this.start_filter(epoch,config,cx);}
+                cx.notify();
+            });
+        }).detach();
+    }
+    fn reset_filters(&mut self, _: &ResetFilters, window: &mut Window, cx: &mut Context<Self>) {
+        for input in &self.filter_inputs {
+            input.update(cx, |input, cx| input.set_text("", window, cx));
+        }
+        self.filter_config = space_store::QueryFilter::default();
+        self.draft_unknown_size = false;
+        self.draft_unknown_time = false;
+        self.filter_error = None;
+        self.rebuild_filters(cx);
+    }
+    fn unknown_size(&mut self, _: &ToggleUnknownSize, _: &mut Window, cx: &mut Context<Self>) {
+        self.draft_unknown_size = !self.draft_unknown_size;
+        self.debounce_filters(cx);
+    }
+    fn unknown_time(&mut self, _: &ToggleUnknownTime, _: &mut Window, cx: &mut Context<Self>) {
+        self.draft_unknown_time = !self.draft_unknown_time;
+        self.debounce_filters(cx);
+    }
+    fn show_treemap(&mut self, _: &ShowTreemap, _: &mut Window, cx: &mut Context<Self>) {
+        self.view = View::Treemap;
+        self.request_query(None, cx);
+    }
+    fn toggle_subtree(&mut self, _: &ToggleSubtree, _: &mut Window, cx: &mut Context<Self>) {
+        self.subtree_only = !self.subtree_only;
+        self.request_query(None, cx);
+    }
+    fn chart_event(&mut self, event: treemap::Event, _: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            treemap::Event::Select(node) => {
+                if !self.treemap.items.iter().any(|item| item.node == node) {
+                    return;
+                }
+                self.clear_aliases();
+                self.chart_selected = Some(node);
+                if let Some(ix) = self.rows.iter().position(|r| r.entry.node == node) {
+                    self.selected = ix;
+                    self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+                }
+                cx.notify();
+            }
+            treemap::Event::Open(node) => {
+                if let Some(label) = chart_folder(&self.treemap, node) {
+                    self.breadcrumbs.push((node, label));
+                    self.request_query(None, cx);
+                }
+            }
+            treemap::Event::OpenOther => {
+                self.view = View::Folders;
+                self.request_query(None, cx);
+            }
+        }
+    }
     fn request_query(&mut self, cursor: Option<PageCursor>, cx: &mut Context<Self>) {
+        if self.maintenance_busy {
+            return;
+        }
         let (Some(snapshot), Some((parent, _))) = (&self.snapshot, self.breadcrumbs.last()) else {
             return;
         };
@@ -331,14 +1085,26 @@ impl Space {
             scan: snapshot.scan,
             parent: *parent,
             view: self.view,
-            metric: self.metric,
+            metric: self.applied_metric,
             cursor,
+            subtree_only: self.subtree_only,
+            filtered: self.filter_session.clone(),
         };
         self.rows.clear();
+        self.row_paths.clear();
+        self.clear_aliases();
+        clear_chart(&mut self.treemap, &mut self.chart_selected);
+        self.current_totals = None;
         self.selected = 0;
         self.next_page = None;
         if self.query_busy {
-            self.pending_query = Some((generation, query));
+            if let Some(old) = self.pending_query.replace((generation, query)) {
+                self.executor
+                    .spawn(async move {
+                        drop(old);
+                    })
+                    .detach();
+            }
         } else {
             self.start_query(generation, query, cx);
         }
@@ -346,6 +1112,11 @@ impl Space {
     }
     fn start_query(&mut self, generation: u64, query: Query, cx: &mut Context<Self>) {
         let (Some(backend), Some(pin)) = (self.backend.clone(), self.snapshot.clone()) else {
+            self.executor
+                .spawn(async move {
+                    drop(query);
+                })
+                .detach();
             return;
         };
         self.query_busy = true;
@@ -359,9 +1130,45 @@ impl Space {
                 this.query_busy = false;
                 if this.query_generation == generation {
                     match result {
-                        Ok(page) => {
-                            this.rows = page.entries;
-                            this.next_page = page.next;
+                        Ok(result) => {
+                            this.current_totals = Some(result.current);
+                            this.treemap = result
+                                .summary
+                                .map(|summary| treemap::Model {
+                                    items: summary
+                                        .page
+                                        .entries
+                                        .into_iter()
+                                        .map(|row| {
+                                            let total = if this.applied_metric == Metric::Logical {
+                                                row.logical
+                                            } else {
+                                                row.allocated
+                                            };
+                                            treemap::Item {
+                                                node: row.entry.node,
+                                                label: row.entry.display_name.clone(),
+                                                detail: format!(
+                                                    "{} · {}",
+                                                    row.entry.display_name,
+                                                    total_text(&row, this.applied_metric)
+                                                ),
+                                                bytes: total.observed_bytes,
+                                                unknown_count: total.unknown_count,
+                                                is_directory: row.entry.kind
+                                                    == EntryKind::Directory,
+                                            }
+                                        })
+                                        .collect(),
+                                    other_bytes: u128::from(summary.other_bytes),
+                                    other_count: summary.other_count,
+                                    unknown_count: summary.unknown_count,
+                                    zero_count: summary.zero_count,
+                                })
+                                .unwrap_or_default();
+                            this.row_paths = result.display_paths;
+                            this.rows = result.page.entries;
+                            this.next_page = result.page.next;
                             this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                         }
                         Err(error) => this.status = format!("Cached query failed: {error}"),
@@ -389,10 +1196,13 @@ impl Space {
         } else {
             Metric::Logical
         };
-        self.request_query(None, cx);
+        self.rebuild_filters(cx);
     }
     fn next_page(&mut self, _: &NextPage, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(cursor) = self.next_page {
+            if self.view == View::Treemap {
+                self.view = View::Folders;
+            }
             self.request_query(Some(cursor), cx);
         }
     }
@@ -400,10 +1210,12 @@ impl Space {
         self.request_query(None, cx);
     }
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.clear_aliases();
         self.selected = self
             .selected
             .saturating_add_signed(delta)
             .min(self.rows.len().saturating_sub(1));
+        self.chart_selected = self.rows.get(self.selected).map(|r| r.entry.node);
         self.scroll
             .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         cx.notify();
@@ -426,7 +1238,7 @@ impl Space {
         }
     }
     fn next_saved(&mut self, _: &NextSavedRoot, _: &mut Window, cx: &mut Context<Self>) {
-        if self.root_busy || self.roots.is_empty() {
+        if self.maintenance_busy || self.root_busy || self.roots.is_empty() {
             return;
         }
         let index = self
@@ -461,16 +1273,22 @@ impl Space {
         .detach();
     }
     fn path_action(&mut self, reveal: bool, cx: &mut Context<Self>) {
-        if self.intent.path_busy {
+        if self.maintenance_busy || self.intent.path_busy {
             return;
         }
         let (Some(backend), Some(snapshot)) = (self.backend.clone(), self.snapshot.clone()) else {
             return;
         };
-        let node = self
-            .rows
-            .get(self.selected)
-            .map_or(snapshot.root_entry.entry.node, |r| r.entry.node);
+        let node = if let Some(node) = self.alias_selected {
+            node
+        } else if self.view == View::Treemap {
+            self.chart_selected
+                .unwrap_or(snapshot.root_entry.entry.node)
+        } else {
+            self.rows
+                .get(self.selected)
+                .map_or(snapshot.root_entry.entry.node, |r| r.entry.node)
+        };
         self.intent.path_busy = true;
         let scan = snapshot.scan;
         let task = cx.background_executor().spawn(async move {
@@ -493,7 +1311,7 @@ impl Space {
 
 impl Render for Space {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let metric = if self.metric == Metric::Logical {
+        let metric = if self.applied_metric == Metric::Logical {
             "logical / apparent"
         } else {
             "allocated (unknown excluded from largest)"
@@ -509,7 +1327,7 @@ impl Render for Space {
                 )
             })
             .unwrap_or_default();
-        let snapshot_label=self.snapshot.as_ref().map(|s|format!("Cached scan {} · {} · {} · {} errors · {} unknown entries · {} excluded/boundary scopes",s.scan.get(),s.path.to_path_buf().map(|p|p.to_string_lossy().into_owned()).unwrap_or_else(|_|"Foreign native path".into()),total_text(&s.root_entry,self.metric),s.root_entry.coverage.error_count,s.root_entry.coverage.unknown_entries,s.root_entry.coverage.excluded_scopes+s.root_entry.coverage.boundary_scopes)).unwrap_or_else(||"No published scan yet.".into());
+        let snapshot_label=self.snapshot.as_ref().map(|s|format!("Cached scan {} (unfiltered root) · {} · {} · {} errors · {} unknown entries · {} excluded/boundary scopes",s.scan.get(),s.path.to_path_buf().map(|p|p.to_string_lossy().into_owned()).unwrap_or_else(|_|"Foreign native path".into()),total_text(&s.root_entry,self.applied_metric),s.root_entry.coverage.error_count,s.root_entry.coverage.unknown_entries,s.root_entry.coverage.excluded_scopes+s.root_entry.coverage.boundary_scopes)).unwrap_or_else(||"No published scan yet.".into());
         let interval_label = self
             .snapshot
             .as_ref()
@@ -536,52 +1354,86 @@ impl Render for Space {
             .as_ref()
             .map(|p| format!("Next scan: {}", p.to_string_lossy()))
             .unwrap_or_default();
-        let view = if self.view == View::Folders {
-            "Folders: native-name order"
-        } else {
-            "Largest files: whole scan, charged unique sizes descending"
+        let view = match self.view {
+            View::Folders => "Folders: charged size descending",
+            View::Largest => "Largest files: charged unique size descending",
+            View::Treemap => "Treemap: current folder, bounded tiles with Other",
         };
         div().id("space").role(Role::Application).aria_label("Space disk explorer").track_focus(&self.focus).key_context("Space")
             .on_action(cx.listener(Self::choose_folder)).on_action(cx.listener(Self::refresh)).on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::show_aliases)).on_action(cx.listener(Self::next_aliases)).on_action(cx.listener(Self::show_cache)).on_action(cx.listener(Self::refresh_volumes)).on_action(cx.listener(Self::next_volumes))
+            .on_action(cx.listener(Self::show_treemap)).on_action(cx.listener(Self::toggle_subtree)).on_action(cx.listener(Self::toggle_filters)).on_action(cx.listener(Self::reset_filters)).on_action(cx.listener(Self::apply_filters)).on_action(cx.listener(Self::cancel_filter)).on_action(cx.listener(Self::unknown_size)).on_action(cx.listener(Self::unknown_time))
             .on_action(cx.listener(Self::folders)).on_action(cx.listener(Self::largest)).on_action(cx.listener(Self::metric))
             .on_action(cx.listener(Self::up)).on_action(cx.listener(Self::next_page)).on_action(cx.listener(Self::first_page)).on_action(cx.listener(Self::next_saved))
             .on_action(cx.listener(|this,_:&CopyPath,_,cx|this.path_action(false,cx)))
             .on_action(cx.listener(|this,_:&RevealPath,_,cx|this.path_action(true,cx)))
             .on_action(cx.listener(|_,_:&FocusNext,w,cx|w.focus_next(cx))).on_action(cx.listener(|_,_:&FocusPrevious,w,cx|w.focus_prev(cx)))
             .on_action(|_:&CloseWindow,w,_|w.remove_window())
-            .size_full().flex().flex_col().gap_2().p_4().bg(rgb(0x17212b)).text_color(rgb(0xe6edf3))
+            .size_full().overflow_y_scroll().flex().flex_col().gap_2().p_4().bg(rgb(0x17212b)).text_color(rgb(0xe6edf3))
             .child(div().text_xl().child("Space · local disk explorer"))
             .child(div().flex().flex_wrap().gap_2()
                 .child(control("choose","Choose folder (Ctrl+O)").on_click(cx.listener(|t,_,w,cx|t.choose_folder(&ChooseFolder,w,cx))))
                 .child(control("refresh","Scan / Refresh (Ctrl+R)").on_click(cx.listener(|t,_,w,cx|t.refresh(&Refresh,w,cx))))
                 .child(control("cancel","Cancel (Esc)").on_click(cx.listener(|t,_,w,cx|t.cancel(&Cancel,w,cx))))
+                .child(control("cache","Cache / diagnostics").on_click(cx.listener(|t,_,w,cx|t.show_cache(&ShowCache,w,cx))))
                 .child(control("saved","Next saved root").on_click(cx.listener(|t,_,w,cx|t.next_saved(&NextSavedRoot,w,cx)))))
+            .child(control("volume-toggle","Show / hide mounted targets").on_click(cx.listener(|t,_,_,cx|{t.volumes_visible=!t.volumes_visible;cx.notify();})))
+            .when(self.volumes_visible,|e|e.child(div().flex().gap_2().child(control("volume-refresh","Refresh mounted targets").on_click(cx.listener(|t,_,w,cx|t.refresh_volumes(&RefreshVolumes,w,cx))))
+                .child(control("volume-next","Next targets page").on_click(cx.listener(|t,_,w,cx|t.next_volumes(&NextVolumes,w,cx)))))
+            .child(if self.volume_busy {"Reading OS mount metadata…"}else{"Mounted targets: choose one, then explicitly Scan. Capacity is OS available space, separate from scan totals."})
+            .when_some(self.volumes.as_ref(),|e,list|e.child(format!("Observed mounts at {} UTC-seconds · {} targets · {} discovery issues · complete: {}",list.observed_at.seconds,list.volumes.len(),list.issues.len(),list.complete))
+                .child(div().flex().flex_wrap().gap_2().children(list.volumes.iter().enumerate().skip(self.volume_page*8).take(8).map(|(ix,volume)|{
+                    let path=volume.mount_path.clone();
+                    let label=format!("{} · {} · {} · removable {:?} · {}",volume.label,volume.aliases.first().unwrap_or(&volume.mount_path).to_path_buf().map(|p|p.to_string_lossy().into_owned()).unwrap_or_else(|_|"Foreign native path".into()),volume.filesystem,volume.removable,volume.capacity.as_ref().map(|c|format!("{} available / {} capacity bytes",c.available_bytes,c.total_bytes)).unwrap_or_else(||"capacity unknown".into()));
+                    div().id(("volume",ix)).role(Role::Button).aria_label(SharedString::from(label.clone())).focusable().tab_stop(true).border_2().border_color(rgb(0x285166)).focus(|s|s.border_color(rgb(0x90d5ff))).px_2().py_1().cursor_pointer().on_click(cx.listener(move|t,_,_,cx|{match path.to_path_buf(){Ok(path)=>{t.intent.chosen=Some(path);t.status="Mounted target selected. Press Scan / Refresh to start; identity is checked again.".into();},Err(error)=>t.status=error.to_string()}cx.notify();})).child(label)
+                }))))
+            )
             .child(chosen).child(snapshot_label).child(interval_label).child(self.scan_status.clone()).child(progress)
             .child(div().flex().flex_wrap().gap_2()
                 .child(control("folders","Folders").on_click(cx.listener(|t,_,w,cx|t.folders(&Folders,w,cx))))
+                .child(control("chart","Treemap").on_click(cx.listener(|t,_,w,cx|t.show_treemap(&ShowTreemap,w,cx))))
+                .child(control("scope","Toggle largest: root / subtree").on_click(cx.listener(|t,_,w,cx|t.toggle_subtree(&ToggleSubtree,w,cx))))
+                .child(control("filters","Show / hide filters").on_click(cx.listener(|t,_,w,cx|t.toggle_filters(&ToggleFilters,w,cx))))
                 .child(control("largest","Largest files").on_click(cx.listener(|t,_,w,cx|t.largest(&Largest,w,cx))))
                 .child(control("metric","Toggle size metric").on_click(cx.listener(|t,_,w,cx|t.metric(&ToggleMetric,w,cx))))
                 .child(control("up","Up (Alt+Up)").on_click(cx.listener(|t,_,w,cx|t.up(&GoUp,w,cx))))
                 .child(control("open","Open folder (Enter)").on_click(cx.listener(|t,_,w,cx|t.open_row(&OpenRow,w,cx)))))
+            .when(self.filters_visible,|e|e.child(div().flex().flex_wrap().gap_2().children(self.filter_inputs.iter().cloned().enumerate().map(|(ix,input)|div().id(("field",ix)).w(px(220.)).child(input))))
+                .child(div().flex().gap_2().child(control("apply-filter","Apply filters").on_click(cx.listener(|t,_,w,cx|t.apply_filters(&ApplyFilters,w,cx))))
+                .child(control("cancel-filter","Cancel filter").on_click(cx.listener(|t,_,w,cx|t.cancel_filter(&CancelFilter,w,cx))))
+                .child(control("reset","Reset filters").on_click(cx.listener(|t,_,w,cx|t.reset_filters(&ResetFilters,w,cx))))
+                .child(control("unknown-size","Toggle unknown size").on_click(cx.listener(|t,_,w,cx|t.unknown_size(&ToggleUnknownSize,w,cx))))
+                .child(control("unknown-time","Toggle unknown time").on_click(cx.listener(|t,_,w,cx|t.unknown_time(&ToggleUnknownTime,w,cx))))))
+            .child(self.filter_error.clone().unwrap_or_default())
+            .child(format!("{} · constrained unknown size: {} · constrained unknown time: {}",self.filter_status,self.applied_filter.include_unknown_size,self.applied_filter.include_unknown_time))
             .child(format!("{view} · {metric}"))
-            .child(format!("Scope: {}",if self.view == View::Largest {"whole saved root".into()} else {self.breadcrumbs.iter().map(|(_,name)|name.as_str()).collect::<Vec<_>>().join(" / ")}))
+            .child(format!("Scope: {}",if self.view == View::Largest && !self.subtree_only {"whole saved root".into()} else {self.breadcrumbs.iter().map(|(_,name)|name.as_str()).collect::<Vec<_>>().join(" / ")}))
+            .child(self.current_totals.as_ref().map(|row|format!("Current folder{}: {}",if self.filter_session.is_some(){" (filtered)"}else{""},total_text(row,self.applied_metric))).unwrap_or_default())
             .child(self.status.clone())
+            .when(self.cache_visible,|e|e.child(cache_management::render(&self.cache_model,cx,Self::cache_event)))
+            .when(self.view==View::Treemap,|e|e.child(treemap::view(&self.treemap,self.chart_selected,cx,Self::chart_event)))
             .child(div().id("entries").role(Role::ListBox).aria_label("Cached entries").track_focus(&self.list_focus).tab_stop(true).key_context("SpaceList")
-                .flex_1().min_h_0().border_2().border_color(rgb(0x285166)).focus(|s|s.border_color(rgb(0x90d5ff)))
+                .flex_1().min_h(px(220.)).flex_shrink_0().border_2().border_color(rgb(0x285166)).focus(|s|s.border_color(rgb(0x90d5ff)))
                 .on_action(cx.listener(|t,_:&NextRow,_,cx|t.move_selection(1,cx))).on_action(cx.listener(|t,_:&PreviousRow,_,cx|t.move_selection(-1,cx)))
                 .on_action(cx.listener(Self::open_row))
                 .child(uniform_list("rows",self.rows.len(),cx.processor(|this,range:std::ops::Range<usize>,_,cx|{
-                    range.map(|ix|{let row=&this.rows[ix];let label=format!("{} {} {} · {}{}",if ix==this.selected {">"}else{" "},if row.entry.kind==EntryKind::Directory {"[folder]"}else{"[file]"},row.entry.display_name,total_text(row,this.metric),if !row.canonical {" · hardlink alias"}else{""});
+                    range.map(|ix|{let row=&this.rows[ix];let label=format!("{} {} {}{} · modified {} · {}{}",if ix==this.selected {">"}else{" "},if row.entry.kind==EntryKind::Directory {"[folder]"}else{"[file]"},row.entry.display_name,this.row_paths.get(ix).map(|p|format!(" · {p}")).unwrap_or_default(),row.entry.modified.and_then(|t|chrono::DateTime::from_timestamp(t.seconds,t.nanos)).map(|t|t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(||"unknown".into()),total_text(row,this.applied_metric),if !row.canonical {" · hardlink alias"}else{""});
                         div().id(ix).role(Role::ListBoxOption).aria_label(SharedString::from(label.clone())).aria_selected(ix==this.selected)
                             .aria_position_in_set(ix+1).aria_size_of_set(this.rows.len()).h(px(30.)).px_2().cursor_pointer()
                             .when(ix==this.selected,|e|e.bg(rgb(0x285166)).aria_active_descendant())
-                            .on_click(cx.listener(move |t,_,w,cx|{w.focus(&t.list_focus,cx);t.selected=ix;cx.notify();})).child(label)
+                            .on_click(cx.listener(move |t,_,w,cx|{w.focus(&t.list_focus,cx);t.clear_aliases();t.selected=ix;t.chart_selected=t.rows.get(ix).map(|r|r.entry.node);cx.notify();})).child(label)
                     }).collect::<Vec<_>>()
                 })).track_scroll(&self.scroll).h_full()))
+            .when(!self.alias_nodes.is_empty(),|e|e.child(div().id("alias-list").max_h(px(120.)).overflow_y_scroll().children(self.alias_nodes.iter().map(|(node,path)|{
+                let node=*node;let generation=self.alias_generation;let scan=self.snapshot.as_ref().map(|s|s.scan);let label=format!("{} {}",if self.alias_selected==Some(node){">"}else{" "},path);
+                div().id(("alias",node.get() as usize)).role(Role::Button).aria_label(SharedString::from(label.clone())).focusable().tab_stop(true).focus(|s|s.bg(rgb(0x285166))).cursor_pointer().on_click(cx.listener(move|t,_,_,cx|{if alias_selection_is_current((generation,scan),(t.alias_generation,t.snapshot.as_ref().map(|s|s.scan)),node,&t.alias_nodes){t.alias_selected=Some(node);cx.notify();}})).child(label)
+            }))))
             .child(if self.query_busy {"Loading cached page…"}else if self.rows.is_empty(){"No entries in this view."}else{""})
             .child(div().flex().flex_wrap().gap_2()
                 .child(control("first","First page").on_click(cx.listener(|t,_,w,cx|t.first_page(&FirstPage,w,cx))))
                 .child(control("next","Next page").on_click(cx.listener(|t,_,w,cx|t.next_page(&NextPage,w,cx))))
+                .child(control("aliases","Choose hardlink alias").on_click(cx.listener(|t,_,w,cx|t.show_aliases(&ShowAliases,w,cx))))
+                .child(control("aliases-next","Next aliases").on_click(cx.listener(|t,_,w,cx|t.next_aliases(&NextAliases,w,cx))))
                 .child(control("copy","Copy path (Ctrl+Shift+C)").on_click(cx.listener(|t,_,_,cx|t.path_action(false,cx))))
                 .child(control("reveal","Reveal (Ctrl+Shift+R)").on_click(cx.listener(|t,_,_,cx|t.path_action(true,cx)))))
             .child("Metadata only. Totals describe observed included files, not reclaimable space. No deletion or content opening.")
@@ -598,6 +1450,7 @@ fn main() {
         std::process::exit(1);
     }
     gpui_platform::application().run(|cx: &mut App| {
+        text_input::init(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-o", ChooseFolder, Some("Space")),
             KeyBinding::new("ctrl-r", Refresh, Some("Space")),

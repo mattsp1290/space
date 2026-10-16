@@ -11,6 +11,7 @@ name = "space"
 path = "src/main.rs"
 
 [dependencies]
+unicode-segmentation = "=1.13.3"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 space-core = { path = "../space-core" }
 space-scan = { path = "../space-scan" }

@@ -2,17 +2,20 @@
 
 A local-only desktop disk explorer, being built in Rust with GPUI.
 
-## Current status: first scan/cache browsing slice
+## Current status: cached browsing and visualization slice
 
 Choose a local folder and explicitly start a metadata-only scan. Space stores
 immutable results in SQLite and reopens them without rescanning, including when
-the source is disconnected. Browse paged folders or whole-scan largest files,
+the source is disconnected. Browse size-sorted folders, subtree or root largest files,
+bounded treemaps, and explicit name/path/extension/size/time filters. Mounted-target
+selection, hardlink alias selection, and confirmed cache-only removal are included.
+Inspect cached diagnostics,
 switch logical/allocated metrics, cancel scans, copy paths, and reveal validated
 live paths. A previous snapshot stays available while a new scan runs.
 
-This is an early implementation, not a disk-explorer release. Treemap, filters,
-size-sorted folder views, subtree-largest, Changes, root management and complete
-diagnostics remain unfinished. See [slice scope and limitations](docs/scan-slice.md).
+This is an early implementation, not a disk-explorer release. Changes comparison,
+root relinking and complete release validation remain unfinished. The new controls
+await exact-revision native CI; Windows traversal currently has a known test failure. See [slice scope and limitations](docs/scan-slice.md).
 
 The G0 bootstrap passed all four native CI targets. Current acceptance uses native
 CI as approved on 2026-10-16; hardware checks remain deferred. Build/CLI smoke

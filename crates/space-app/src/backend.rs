@@ -1,6 +1,9 @@
 //! Synchronous service boundary. Every function is called off the GPUI thread.
 use space_core::*;
-use space_store::{Cache, CacheReader, Page, PageCursor, RootRecord, ScanPin, StoredEntry};
+use space_store::{
+    Cache, CacheReader, ChildrenSummary, FilteredView, Page, PageCursor, QueryFilter, RootRecord,
+    ScanPin, StoredEntry,
+};
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -14,6 +17,7 @@ use std::{
 pub struct Backend {
     writer: Arc<Mutex<Cache>>,
     reader: Arc<Mutex<CacheReader>>,
+    filter_reader: Arc<Mutex<CacheReader>>,
 }
 pub type Result<T> = std::result::Result<T, String>;
 pub const PAGE_SIZE: usize = 100;
@@ -35,14 +39,17 @@ pub struct Opened {
 pub enum View {
     Folders,
     Largest,
+    Treemap,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Query {
     pub scan: ScanId,
     pub parent: NodeId,
     pub view: View,
     pub metric: Metric,
     pub cursor: Option<PageCursor>,
+    pub subtree_only: bool,
+    pub filtered: Option<crate::deferred::Deferred<Filtered>>,
 }
 #[derive(Default)]
 pub struct Progress {
@@ -100,6 +107,7 @@ fn snapshot(cache: &CacheReader, root: RootRecord, scan: ScanId) -> Result<Snaps
 pub fn open(directory: &Path) -> Result<Opened> {
     let cache = Cache::open(directory).map_err(error)?;
     let reader = cache.reader().map_err(error)?;
+    let filter_reader = cache.reader().map_err(error)?;
     let roots = published_roots(&reader)?;
     let mut latest = None;
     for root in &roots {
@@ -118,6 +126,7 @@ pub fn open(directory: &Path) -> Result<Opened> {
         backend: Backend {
             writer: Arc::new(Mutex::new(cache)),
             reader: Arc::new(Mutex::new(reader)),
+            filter_reader: Arc::new(Mutex::new(filter_reader)),
         },
         roots,
         snapshot,
@@ -131,13 +140,144 @@ pub fn open_root(backend: &Backend, root: RootRecord) -> Result<Snapshot> {
         .ok_or("This saved root has no published scan.")?;
     snapshot(&cache, root, scan)
 }
-pub fn query(backend: &Backend, query: Query) -> Result<Page> {
-    let cache = read(backend)?;
-    match query.view {
-        View::Folders => cache.children(query.scan, query.parent, query.cursor, PAGE_SIZE),
-        View::Largest => cache.largest(query.scan, query.metric, query.cursor, PAGE_SIZE),
+pub struct Filtered {
+    pub view: Mutex<FilteredView>,
+    pub root: StoredEntry,
+    pub matching_count: u64,
+}
+pub fn filter(
+    backend: &Backend,
+    scan: ScanId,
+    metric: Metric,
+    config: &QueryFilter,
+    cancel: &Cancellation,
+) -> Result<Arc<Filtered>> {
+    let reader = backend
+        .filter_reader
+        .lock()
+        .map_err(|_| "Filter reader lock poisoned")?;
+    let view = reader
+        .filtered(scan, metric, config, cancel)
+        .map_err(error)?;
+    let root = view.root_entry().map_err(error)?;
+    let matching_count = view.matching_count().map_err(error)?;
+    Ok(Arc::new(Filtered {
+        view: Mutex::new(view),
+        root,
+        matching_count,
+    }))
+}
+pub struct Queried {
+    pub page: Page,
+    pub current: StoredEntry,
+    pub summary: Option<ChildrenSummary>,
+    pub display_paths: Vec<String>,
+}
+pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
+    let subtree = query.subtree_only.then_some(query.parent);
+    if let Some(filtered) = &query.filtered {
+        let view = filtered
+            .view
+            .lock()
+            .map_err(|_| "Filtered view lock poisoned")?;
+        let current = view.entry(query.parent).map_err(error)?;
+        let summary = (query.view == View::Treemap)
+            .then(|| view.children_summary(query.parent, PAGE_SIZE))
+            .transpose()
+            .map_err(error)?;
+        let page = match query.view {
+            View::Folders | View::Treemap => view.children(query.parent, query.cursor, PAGE_SIZE),
+            View::Largest => view.largest(subtree, query.cursor, PAGE_SIZE),
+        }
+        .map_err(error)?;
+        let display_paths = if query.view == View::Largest {
+            paths_for_page(&page, |node| view.native_path(node).map_err(error))?
+        } else {
+            Vec::new()
+        };
+        return Ok(Queried {
+            page,
+            current,
+            summary,
+            display_paths,
+        });
     }
-    .map_err(error)
+    let cache = read(backend)?;
+    let current = cache.entry(query.scan, query.parent).map_err(error)?;
+    let summary = (query.view == View::Treemap)
+        .then(|| cache.children_summary(query.scan, query.parent, query.metric, PAGE_SIZE))
+        .transpose()
+        .map_err(error)?;
+    let page = match query.view {
+        View::Folders | View::Treemap => cache.children_sorted(
+            query.scan,
+            query.parent,
+            query.metric,
+            query.cursor,
+            PAGE_SIZE,
+        ),
+        View::Largest => {
+            cache.largest_in(query.scan, subtree, query.metric, query.cursor, PAGE_SIZE)
+        }
+    }
+    .map_err(error)?;
+    let display_paths = if query.view == View::Largest {
+        paths_for_page(&page, |node| {
+            cache.native_path(query.scan, node).map_err(error)
+        })?
+    } else {
+        Vec::new()
+    };
+    Ok(Queried {
+        page,
+        current,
+        summary,
+        display_paths,
+    })
+}
+
+fn paths_for_page(
+    page: &Page,
+    mut path: impl FnMut(NodeId) -> Result<NativePath>,
+) -> Result<Vec<String>> {
+    page.entries
+        .iter()
+        .map(|row| {
+            path(row.entry.node)?
+                .to_path_buf()
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(error)
+        })
+        .collect()
+}
+pub struct Aliases {
+    pub entries: Vec<(NodeId, String)>,
+    pub next: Option<PageCursor>,
+}
+pub fn aliases(
+    backend: &Backend,
+    scan: ScanId,
+    node: NodeId,
+    cursor: Option<PageCursor>,
+) -> Result<Aliases> {
+    let reader = read(backend)?;
+    let page = reader.aliases(scan, node, cursor, 100).map_err(error)?;
+    let entries = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let path = reader
+                .native_path(scan, entry.node)
+                .map_err(error)?
+                .to_path_buf()
+                .map_err(error)?;
+            Ok((entry.node, path.to_string_lossy().into_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Aliases {
+        entries,
+        next: page.next,
+    })
 }
 
 pub struct ScanRequest {
@@ -309,6 +449,83 @@ pub fn validated_reveal_path(
     Ok(path)
 }
 
+pub struct CacheRow {
+    pub info: space_store::ScanInfo,
+    pub path: NativePath,
+    pub totals: Option<StoredEntry>,
+}
+pub struct Inspection {
+    pub rows: Vec<CacheRow>,
+    pub next: Option<ScanId>,
+    pub footprint: space_store::CacheFootprint,
+    pub issues: Option<space_store::IssuePage>,
+}
+pub fn inspect_cache(
+    backend: &Backend,
+    before: Option<ScanId>,
+    selected: Option<ScanId>,
+    after: Option<i64>,
+) -> Result<Inspection> {
+    let cache = read(backend)?;
+    let page = cache.scans(before, 100).map_err(error)?;
+    let rows = page
+        .scans
+        .into_iter()
+        .map(|info| {
+            let scan = info.spec.key.id;
+            Ok(CacheRow {
+                path: cache.scan_path(scan).map_err(error)?,
+                totals: if info.status == ScanStatus::Published {
+                    Some(cache.root_entry(scan).map_err(error)?)
+                } else {
+                    None
+                },
+                info,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Inspection {
+        rows,
+        next: page.next,
+        footprint: cache.footprint().map_err(error)?,
+        issues: selected
+            .map(|scan| cache.issues(scan, after, 50))
+            .transpose()
+            .map_err(error)?,
+    })
+}
+pub struct Reloaded {
+    pub roots: Vec<RootRecord>,
+    pub snapshot: Option<Snapshot>,
+}
+pub fn reload(backend: &Backend) -> Result<Reloaded> {
+    let cache = read(backend)?;
+    let roots = published_roots(&cache)?;
+    let mut latest = None;
+    for root in &roots {
+        if let Some(scan) = cache.latest(root.id).map_err(error)?
+            && latest
+                .as_ref()
+                .is_none_or(|(_, previous): &(RootRecord, ScanId)| scan > *previous)
+        {
+            latest = Some((root.clone(), scan));
+        }
+    }
+    let snapshot = latest
+        .map(|(root, scan)| snapshot(&cache, root, scan))
+        .transpose()?;
+    Ok(Reloaded { roots, snapshot })
+}
+/// Caller must confirm this exact cache-only scope and release active view pins.
+pub fn remove_cached(backend: &Backend, scan: Option<ScanId>) -> Result<()> {
+    let mut cache = lock(backend)?;
+    match scan {
+        Some(scan) => cache.remove_scan(scan),
+        None => cache.clear_cache(),
+    }
+    .map_err(error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +548,128 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn filtered_hierarchy_largest_and_chart_share_charged_totals() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("source");
+        let directory = fixture.0.join("cache");
+        std::fs::create_dir_all(path.join("nested")).unwrap();
+        std::fs::write(path.join("keep.txt"), b"12345").unwrap();
+        std::fs::write(path.join("skip.bin"), b"123456789").unwrap();
+        std::fs::write(path.join("nested/keep.txt"), b"123").unwrap();
+        let opened = open(&directory).unwrap();
+        let done = scan(
+            &opened.backend,
+            ScanRequest {
+                path,
+                cache_directory: directory,
+                refresh_root: None,
+                generation: 1,
+            },
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let config = QueryFilter {
+            extension: Some("TXT".into()),
+            ..QueryFilter::default()
+        };
+        let filtered = filter(
+            &opened.backend,
+            done.snapshot.scan,
+            Metric::Logical,
+            &config,
+            &Cancellation::new(),
+        )
+        .unwrap();
+        assert_eq!(filtered.matching_count, 2);
+        assert_eq!(filtered.root.logical.observed_bytes, 8);
+        let query_spec = Query {
+            scan: done.snapshot.scan,
+            parent: done.snapshot.root_entry.entry.node,
+            view: View::Treemap,
+            metric: Metric::Logical,
+            cursor: None,
+            subtree_only: true,
+            filtered: Some(crate::deferred::Deferred::new(filtered.clone(), drop)),
+        };
+        let result = query(&opened.backend, query_spec.clone()).unwrap();
+        let summary = result.summary.unwrap();
+        assert_eq!(summary.total_bytes, 8);
+        assert_eq!(
+            summary.other_bytes
+                + summary
+                    .page
+                    .entries
+                    .iter()
+                    .map(|r| r.logical.observed_bytes)
+                    .sum::<u64>(),
+            8
+        );
+        assert_eq!(result.current.logical.observed_bytes, 8);
+        assert_eq!(result.page.entries[0].entry.display_name, "keep.txt");
+        let largest = query(
+            &opened.backend,
+            Query {
+                view: View::Largest,
+                ..query_spec
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            largest
+                .page
+                .entries
+                .iter()
+                .map(|r| r.logical.observed_bytes)
+                .collect::<Vec<_>>(),
+            [5, 3]
+        );
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        assert!(
+            filter(
+                &opened.backend,
+                done.snapshot.scan,
+                Metric::Logical,
+                &config,
+                &cancel
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn cache_removal_refuses_pins_and_reloads_empty_without_source_changes() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("source");
+        let directory = fixture.0.join("cache");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("file"), b"keep").unwrap();
+        let opened = open(&directory).unwrap();
+        let done = scan(
+            &opened.backend,
+            ScanRequest {
+                path: path.clone(),
+                cache_directory: directory,
+                refresh_root: None,
+                generation: 1,
+            },
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let scan = done.snapshot.scan;
+        assert!(remove_cached(&opened.backend, Some(scan)).is_err());
+        drop(done);
+        remove_cached(&opened.backend, Some(scan)).unwrap();
+        let empty = reload(&opened.backend).unwrap();
+        assert!(empty.snapshot.is_none());
+        assert!(empty.roots.is_empty());
+        remove_cached(&opened.backend, None).unwrap();
+        assert_eq!(std::fs::read(path.join("file")).unwrap(), b"keep");
     }
     #[test]
     fn failed_traversal_is_not_reported_as_cancellation() {
@@ -444,9 +783,12 @@ mod tests {
                 view: View::Largest,
                 metric: Metric::Logical,
                 cursor: None,
+                subtree_only: false,
+                filtered: None,
             },
         )
         .unwrap();
+        let page = page.page;
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.entries[0].logical.observed_bytes, 7);
         assert_eq!(

@@ -1,4 +1,4 @@
-pub const VERSION: i64 = 1;
+pub const VERSION: i64 = 3;
 pub const CREATE: &str = r#"
 CREATE TABLE roots(id INTEGER PRIMARY KEY, identity BLOB NOT NULL, policy BLOB NOT NULL);
 CREATE TABLE scans(id INTEGER PRIMARY KEY, root INTEGER NOT NULL REFERENCES roots(id), generation INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('scanning','finalizing','published','cancelled','failed','interrupted')), next_sequence INTEGER NOT NULL DEFAULT 0, started INTEGER NOT NULL, started_nanos INTEGER NOT NULL, ended INTEGER, ended_nanos INTEGER, selected_path BLOB NOT NULL, metadata BLOB NOT NULL);
@@ -16,4 +16,18 @@ CREATE TABLE coverage(scan INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCA
 CREATE TABLE errors(scan INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,node INTEGER,data BLOB NOT NULL);
 CREATE INDEX errors_node ON errors(scan,node);
 PRAGMA user_version=1;
+"#;
+
+pub const QUERY_INDEX: &str = r#"
+CREATE TABLE child_sizes(scan INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,parent INTEGER,node INTEGER NOT NULL,ordinal INTEGER NOT NULL,logical INTEGER NOT NULL,allocated INTEGER NOT NULL,PRIMARY KEY(scan,node));
+CREATE INDEX children_logical ON child_sizes(scan,parent,logical DESC,ordinal);
+CREATE INDEX children_allocated ON child_sizes(scan,parent,allocated DESC,ordinal);
+INSERT INTO child_sizes SELECT e.scan,e.parent,e.node,e.ordinal,t.logical,t.allocated FROM entries e JOIN totals t ON t.scan=e.scan AND t.node=e.node JOIN scans s ON s.id=e.scan WHERE s.status='published';
+PRAGMA user_version=2;
+"#;
+
+pub const IDS: &str = r#"
+CREATE TABLE id_highwater(singleton INTEGER PRIMARY KEY CHECK(singleton=1),scan INTEGER NOT NULL,root INTEGER NOT NULL);
+INSERT INTO id_highwater VALUES(1,(SELECT coalesce(max(id),0) FROM scans),(SELECT coalesce(max(id),0) FROM roots));
+PRAGMA user_version=3;
 "#;
