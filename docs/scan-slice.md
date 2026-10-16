@@ -24,14 +24,15 @@ are read, uploaded or deleted by scanning. Temporary fixture tests own their dat
 
 - Bounded treemaps, explicit filters, mounted-target selection, cached diagnostics,
   hardlink alias choice and confirmed cache-only removal are integrated. Changes
-  comparison and root relinking remain unfinished. New controls await native CI.
+  comparison and root relinking remain unfinished. Revision `2793d99` passed the
+  complete native CI matrix, including new controls and extracted CLI smoke.
 - Filters retain the previous view while their separate worker computes results.
   Empty filters use indexed base queries directly. Pages contain at most 100 rows;
   treemap Other includes all omitted weight and opens the full paged child scope.
 - Windows held-directory traversal now passes native fixtures after replacing the
   unsupported directory ReOpenFile call with a checked NtCreateFile handle open.
-  A corrected real sharing-conflict regression awaits exact-head CI; complete
-  Windows acceptance is not yet claimed.
+  The corrected real sharing-conflict regression and Windows release/package
+  smoke also passed in revision `2793d99`. Physical GUI checks remain deferred.
 - No root path component may be a symlink/reparse redirect. On macOS, explicitly
   select the canonical location instead of an alias such as `/tmp` or `/var`.
 - Linux requires statx mount IDs under the default policy and allows only known
@@ -70,3 +71,38 @@ was 6.741 ms, with 32,456 KiB peak RSS. A prior equivalent warm run measured
 child-summary computation at 49.93 ms.
 These are development measurements, not cold-cache or reference-hardware gates.
 Filter Apply is explicit and cancellation preserves the previous displayed view.
+
+## Observation comparisons (Changes)
+
+Changes captures the displayed scan, applied filter and metric. Choose an older
+published observation of the same root from bounded pages, then explicitly build
+the comparison. Matching requires compatible lineage, strong root identity,
+normalized scan policy and native path encoding. A separate disk-backed SQLite
+working view pins both observations; computation and connection destruction stay
+on workers. Cancellation and failed builds retain the previous explorer/result.
+
+The hierarchy and largest increase, largest decrease, and growing-directory
+rankings are paged. Ranked ancestors and descendants overlap and must not be
+summed. Each row shows its raw cached before/after totals separately from the
+comparison's accounting contributions, known gross additions/removals and net.
+Unknown or unobserved scopes never establish deletion. Renames are removed plus
+added. Pure hardlink ownership redistribution has zero gross growth. Mixed
+directories retain their independently known gross growth/removal alongside the
+redistribution warning and uncertain net. Genuine shared-group growth is charged once to its
+shared ancestor. Filters match a full endpoint predicate before OR after pairing.
+Copy/reveal chooses an observed endpoint; reveal still validates its live root
+and path existence. It opens the current item at that recorded location, never
+historical contents or a restored file.
+
+Changes is under native CI validation. No million-entry comparison benchmark or
+physical GUI acceptance is claimed by the existing scanner/filter measurements.
+
+A development comparison fixture with 100,000 entries took 35.011 seconds to
+build its disk-backed working view after correcting an adverse SQLite join plan;
+warm top-100 p95 was 46.346 ms with 35,832 KiB peak RSS. Complete pagination
+visited all 100,000 records. This exact-source replay ran alongside other
+verification; a previous sample measured 30.461 s / 9.345 ms, showing container
+variability. A 500-level fixture built in 112.857 ms and queried its subtree in
+0.221 ms. This is cloud development evidence, not a
+million-entry or reference-machine acceptance result. Comparison construction can
+be lengthy, so phase progress/cancellation and retained prior views are required.

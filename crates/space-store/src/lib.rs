@@ -1,5 +1,9 @@
 //! Exclusive, local SQLite cache. Only published snapshots are queryable.
 //! APIs are synchronous: call them on a bounded background writer/query worker.
+mod comparison;
+pub use comparison::*;
+#[cfg(test)]
+mod comparison_tests;
 mod filters;
 mod maintenance;
 mod queries;
@@ -26,6 +30,7 @@ pub enum StoreError {
     Io(std::io::Error),
     Encoding(serde_json::Error),
     Contract(ContractError),
+    ComparisonRefused(ComparisonRefusal),
     InUse,
     Schema(i64),
     Corrupt(String),
@@ -34,6 +39,9 @@ pub enum StoreError {
 }
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::ComparisonRefused(reason) = self {
+            return reason.fmt(f);
+        }
         write!(f, "{self:?}")
     }
 }

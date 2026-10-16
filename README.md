@@ -13,9 +13,13 @@ Inspect cached diagnostics,
 switch logical/allocated metrics, cancel scans, copy paths, and reveal validated
 live paths. A previous snapshot stays available while a new scan runs.
 
-This is an early implementation, not a disk-explorer release. Changes comparison,
-root relinking and complete release validation remain unfinished. The new controls
-await exact-revision native CI; Windows traversal currently has a known test failure. See [slice scope and limitations](docs/scan-slice.md).
+Changes compares compatible cached observations with before/after values,
+coverage-aware changes, and growth/decrease rankings. This follow-on is awaiting
+its own native CI validation.
+
+This is an early implementation, not a disk-explorer release. Root relinking and
+complete release validation remain unfinished. The preceding milestone revision
+`2793d99` passed all five CI jobs across Linux, Windows and both macOS architectures. See [slice scope and limitations](docs/scan-slice.md).
 
 The G0 bootstrap passed all four native CI targets. Current acceptance uses native
 CI as approved on 2026-10-16; hardware checks remain deferred. Build/CLI smoke

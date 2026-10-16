@@ -1,5 +1,7 @@
 mod backend;
 mod cache_management;
+mod changes_controller;
+mod changes_panel;
 mod deferred;
 mod filters;
 mod intent;
@@ -39,6 +41,7 @@ actions!(
         ToggleFilters,
         RefreshVolumes,
         ShowCache,
+        ShowChanges,
         ShowAliases,
         NextAliases,
         NextVolumes,
@@ -81,6 +84,7 @@ impl Drop for Running {
 
 type FilterSession = deferred::Deferred<backend::Filtered>;
 struct Space {
+    changes: changes_controller::State,
     executor: gpui::BackgroundExecutor,
     filters_visible: bool,
     cache_visible: bool,
@@ -230,6 +234,7 @@ impl Space {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         let mut app = Self {
+            changes: changes_controller::State::new(cx.background_executor().clone()),
             executor: cx.background_executor().clone(),
             filters_visible: false,
             cache_visible: false,
@@ -365,6 +370,7 @@ impl Space {
         self.alias_selected = None;
     }
     fn clear_empty_view(&mut self) {
+        self.changes.invalidate();
         self.snapshot = None;
         self.pending_snapshot = None;
         self.filter_session = None;
@@ -535,6 +541,7 @@ impl Space {
             && !self.intent.path_busy
             && !self.root_busy
             && !self.alias_busy
+            && self.changes.idle()
     }
     fn confirm_cache_removal(
         &mut self,
@@ -572,10 +579,12 @@ impl Space {
             this.query_generation+=1;let pending_query=this.pending_query.take();this.filter_epoch+=1;this.filter_pending=None;
             let snapshot=this.snapshot.take();let pending=this.pending_snapshot.take();
             let filtered=this.filter_session.take();
+            let comparison=this.changes.session.take();this.changes.invalidate();
             this.rows.clear();this.row_paths.clear();this.clear_aliases();this.breadcrumbs.clear();clear_chart(&mut this.treemap,&mut this.chart_selected);this.current_totals=None;
             let task=cx.background_executor().spawn(async move {
                 if let Some((_,query))=pending_query && let Some(filtered)=query.filtered{filtered.close_on_worker();}
                 drop(snapshot);drop(pending);if let Some(filtered)=filtered{filtered.close_on_worker();}
+                if let Some(comparison)=comparison{comparison.close_on_worker();}
                 let outcome=backend::remove_cached(&backend,scan);
                 let reloaded=backend::reload(&backend);
                 (outcome,reloaded)
@@ -651,6 +660,7 @@ impl Space {
         }).detach();
     }
     fn apply_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        self.changes.invalidate();
         self.snapshot_request += 1;
         self.pending_snapshot = Some(Arc::new(snapshot));
         self.rebuild_filters(cx);
@@ -787,6 +797,18 @@ impl Space {
         cx.notify();
     }
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running.is_none() && self.changes.build_busy {
+            if let Some(build) = self.changes.model.building {
+                let event = self
+                    .changes
+                    .model
+                    .event(changes_panel::Action::CancelRequested {
+                        request: build.request,
+                    });
+                self.changes_event(event, window, cx);
+            }
+            return;
+        }
         if self.running.is_none() && self.filter_busy {
             self.cancel_filter(&CancelFilter, window, cx);
             return;
@@ -836,6 +858,12 @@ impl Space {
         cx.notify();
     }
     fn apply_filter_inputs(&mut self, cx: &mut Context<Self>) {
+        if self.changes.visible {
+            self.status =
+                "Return to Explorer to change the captured comparison filters or metric.".into();
+            cx.notify();
+            return;
+        }
         if self.maintenance_busy {
             return;
         }
@@ -951,6 +979,12 @@ impl Space {
         }).detach();
     }
     fn reset_filters(&mut self, _: &ResetFilters, window: &mut Window, cx: &mut Context<Self>) {
+        if self.changes.visible {
+            self.status =
+                "Return to Explorer to change the captured comparison filters or metric.".into();
+            cx.notify();
+            return;
+        }
         for input in &self.filter_inputs {
             input.update(cx, |input, cx| input.set_text("", window, cx));
         }
@@ -1121,6 +1155,12 @@ impl Space {
         self.request_query(None, cx);
     }
     fn metric(&mut self, _: &ToggleMetric, _: &mut Window, cx: &mut Context<Self>) {
+        if self.changes.visible {
+            self.status =
+                "Return to Explorer to change the captured comparison filters or metric.".into();
+            cx.notify();
+            return;
+        }
         self.metric = if self.metric == Metric::Logical {
             Metric::Allocated
         } else {
@@ -1291,7 +1331,7 @@ impl Render for Space {
         };
         div().id("space").role(Role::Application).aria_label("Space disk explorer").track_focus(&self.focus).key_context("Space")
             .on_action(cx.listener(Self::choose_folder)).on_action(cx.listener(Self::refresh)).on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::show_aliases)).on_action(cx.listener(Self::next_aliases)).on_action(cx.listener(Self::show_cache)).on_action(cx.listener(Self::refresh_volumes)).on_action(cx.listener(Self::next_volumes))
+            .on_action(cx.listener(Self::show_changes)).on_action(cx.listener(Self::show_aliases)).on_action(cx.listener(Self::next_aliases)).on_action(cx.listener(Self::show_cache)).on_action(cx.listener(Self::refresh_volumes)).on_action(cx.listener(Self::next_volumes))
             .on_action(cx.listener(Self::show_treemap)).on_action(cx.listener(Self::toggle_subtree)).on_action(cx.listener(Self::toggle_filters)).on_action(cx.listener(Self::reset_filters)).on_action(cx.listener(Self::apply_filters)).on_action(cx.listener(Self::cancel_filter)).on_action(cx.listener(Self::unknown_size)).on_action(cx.listener(Self::unknown_time))
             .on_action(cx.listener(Self::folders)).on_action(cx.listener(Self::largest)).on_action(cx.listener(Self::metric))
             .on_action(cx.listener(Self::up)).on_action(cx.listener(Self::next_page)).on_action(cx.listener(Self::first_page)).on_action(cx.listener(Self::next_saved))
@@ -1305,6 +1345,7 @@ impl Render for Space {
                 .child(control("choose","Choose folder (Ctrl+O)").on_click(cx.listener(|t,_,w,cx|t.choose_folder(&ChooseFolder,w,cx))))
                 .child(control("refresh","Scan / Refresh (Ctrl+R)").on_click(cx.listener(|t,_,w,cx|t.refresh(&Refresh,w,cx))))
                 .child(control("cancel","Cancel (Esc)").on_click(cx.listener(|t,_,w,cx|t.cancel(&Cancel,w,cx))))
+                .child(control("changes","Changes / Explorer").on_click(cx.listener(|t,_,w,cx|t.show_changes(&ShowChanges,w,cx))))
                 .child(control("cache","Cache / diagnostics").on_click(cx.listener(|t,_,w,cx|t.show_cache(&ShowCache,w,cx))))
                 .child(control("saved","Next saved root").on_click(cx.listener(|t,_,w,cx|t.next_saved(&NextSavedRoot,w,cx)))))
             .child(control("volume-toggle","Show / hide mounted targets").on_click(cx.listener(|t,_,_,cx|{t.volumes_visible = !t.volumes_visible;cx.notify();})))
@@ -1328,7 +1369,7 @@ impl Render for Space {
                 .child(control("metric","Toggle size metric").on_click(cx.listener(|t,_,w,cx|t.metric(&ToggleMetric,w,cx))))
                 .child(control("up","Up (Alt+Up)").on_click(cx.listener(|t,_,w,cx|t.up(&GoUp,w,cx))))
                 .child(control("open","Open folder (Enter)").on_click(cx.listener(|t,_,w,cx|t.open_row(&OpenRow,w,cx)))))
-            .when(self.filters_visible,|e|e.child(div().flex().flex_wrap().gap_2().children(self.filter_inputs.iter().cloned().enumerate().map(|(ix,input)|div().id(("field",ix)).w(px(220.)).child(input))))
+            .when(self.filters_visible && !self.changes.visible,|e|e.child(div().flex().flex_wrap().gap_2().children(self.filter_inputs.iter().cloned().enumerate().map(|(ix,input)|div().id(("field",ix)).w(px(220.)).child(input))))
                 .child(div().flex().gap_2().child(control("apply-filter","Apply filters").on_click(cx.listener(|t,_,w,cx|t.apply_filters(&ApplyFilters,w,cx))))
                 .child(control("cancel-filter","Cancel filter").on_click(cx.listener(|t,_,w,cx|t.cancel_filter(&CancelFilter,w,cx))))
                 .child(control("reset","Reset filters").on_click(cx.listener(|t,_,w,cx|t.reset_filters(&ResetFilters,w,cx))))
@@ -1340,6 +1381,7 @@ impl Render for Space {
             .child(format!("Scope: {}",if self.view == View::Largest && !self.subtree_only {"whole saved root".into()} else {self.breadcrumbs.iter().map(|(_,name)|name.as_str()).collect::<Vec<_>>().join(" / ")}))
             .child(self.current_totals.as_ref().map(|row|format!("Current folder{}: {}",if self.filter_session.is_some(){" (filtered)"}else{""},total_text(row,self.applied_metric))).unwrap_or_default())
             .child(self.status.clone())
+            .when(self.changes.visible,|e|e.child(changes_panel::render(&self.changes.model,cx,Self::changes_event)))
             .when(self.cache_visible,|e|e.child(cache_management::render(&self.cache_model,cx,Self::cache_event)))
             .when(self.view==View::Treemap,|e|e.child(treemap::view(&self.treemap,self.chart_selected,cx,Self::chart_event)))
             .child(div().id("entries").role(Role::ListBox).aria_label("Cached entries").track_focus(&self.list_focus).tab_stop(true).key_context("SpaceList")

@@ -4,7 +4,7 @@
 Matt explicitly accepts passing CI as the current platform acceptance gate. Real desktop/laptop UI, GPU, accessibility and clean-machine checks are deferred follow-up validation, not blockers for G0 or subsequent feature work. Native-target CI must pass formatting, Clippy, tests, release builds, package assembly and extracted CLI smoke on all four targets. Do not describe this as observed GUI or real-hardware success. The detailed native procedures below remain the later validation checklist. License/distribution safeguards remain separate.
 
 ## G0: prove the native application boundary
-Prerequisite: existing root README.md, LICENSE and .gitignore. No implementation exists. Create new root Cargo.toml, Cargo.lock, rust-toolchain.toml and crates/ with the four crates named in the overview. New symbols and modules are implementation proposals; select idiomatic concrete names during bootstrap.
+Prerequisite: existing root README.md, LICENSE and .gitignore. No implementation existed at the original planning baseline. Create new root Cargo.toml, Cargo.lock, rust-toolchain.toml and crates/ with the four crates named in the overview. New symbols and modules are implementation proposals; select idiomatic concrete names during bootstrap.
 
 Before substantial scanner/UI implementation, pin a mutually compatible GPUI + gpui_platform release or immutable Git revision and Rust compiler. Verify the pinned platform feature set; upstream main currently documents macOS font-kit for glyph rasterization, Linux wayland/x11, and Windows native Win32/DirectWrite. Do not assume examples from a different revision compile. Record pin, compiler, licenses and minimum supported OS/GPU/runtime baselines in new docs/platform-support.md and docs/dependencies.md.
 

@@ -1,4 +1,6 @@
 //! Synchronous service boundary. Every function is called off the GPUI thread.
+#[path = "comparison_backend.rs"]
+pub mod comparison;
 use space_core::*;
 use space_store::{
     Cache, CacheReader, ChildrenSummary, FilteredView, Page, PageCursor, QueryFilter, RootRecord,
@@ -18,6 +20,7 @@ pub struct Backend {
     writer: Arc<Mutex<Cache>>,
     reader: Arc<Mutex<CacheReader>>,
     filter_reader: Arc<Mutex<CacheReader>>,
+    comparison_reader: Arc<Mutex<CacheReader>>,
 }
 pub type Result<T> = std::result::Result<T, String>;
 pub const PAGE_SIZE: usize = 100;
@@ -25,6 +28,7 @@ pub const PAGE_SIZE: usize = 100;
 pub struct Snapshot {
     pub root: RootRecord,
     pub scan: ScanId,
+    pub spec: ScanSpec,
     pub path: NativePath,
     pub interval: (Timestamp, Option<Timestamp>),
     pub root_entry: StoredEntry,
@@ -96,6 +100,7 @@ fn timestamp() -> Result<Timestamp> {
 }
 fn snapshot(cache: &CacheReader, root: RootRecord, scan: ScanId) -> Result<Snapshot> {
     Ok(Snapshot {
+        spec: cache.spec(scan).map_err(error)?,
         path: cache.scan_path(scan).map_err(error)?,
         interval: cache.interval(scan).map_err(error)?,
         root_entry: cache.root_entry(scan).map_err(error)?,
@@ -108,6 +113,7 @@ pub fn open(directory: &Path) -> Result<Opened> {
     let cache = Cache::open(directory).map_err(error)?;
     let reader = cache.reader().map_err(error)?;
     let filter_reader = cache.reader().map_err(error)?;
+    let comparison_reader = cache.reader().map_err(error)?;
     let roots = published_roots(&reader)?;
     let mut latest = None;
     for root in &roots {
@@ -127,6 +133,7 @@ pub fn open(directory: &Path) -> Result<Opened> {
             writer: Arc::new(Mutex::new(cache)),
             reader: Arc::new(Mutex::new(reader)),
             filter_reader: Arc::new(Mutex::new(filter_reader)),
+            comparison_reader: Arc::new(Mutex::new(comparison_reader)),
         },
         roots,
         snapshot,
@@ -548,6 +555,162 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn comparison_preserves_endpoint_paths_pins_and_cancelled_prior_view() {
+        use comparison::{Ranking, build, candidates, path as endpoint_path, query};
+        use space_store::{ComparisonEndpoint, ComparisonProgress};
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let directory = fixture.0.join("cache");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("growth.txt"), b"123").unwrap();
+        std::fs::write(source.join("removed.txt"), b"12345").unwrap();
+        let opened = open(&directory).unwrap();
+        let first = scan(
+            &opened.backend,
+            ScanRequest {
+                path: source.clone(),
+                cache_directory: directory.clone(),
+                refresh_root: None,
+                generation: 1,
+            },
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::write(source.join("growth.txt"), b"123456789").unwrap();
+        std::fs::remove_file(source.join("removed.txt")).unwrap();
+        std::fs::create_dir_all(source.join("nested/deep")).unwrap();
+        std::fs::write(source.join("nested/deep/new.txt"), b"12").unwrap();
+        let second = scan(
+            &opened.backend,
+            ScanRequest {
+                path: source.clone(),
+                cache_directory: directory,
+                refresh_root: Some(first.snapshot.root.clone()),
+                generation: 2,
+            },
+            &Cancellation::new(),
+            &Progress::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let options = candidates(&opened.backend, &second.snapshot, None).unwrap();
+        assert_eq!(options.entries.len(), 1);
+        assert_eq!(options.entries[0].scan.spec.key.id, first.snapshot.scan);
+        assert_eq!(options.entries[0].path, first.snapshot.path);
+        assert!(options.entries[0].unavailable.is_none());
+        let before = first.snapshot.scan;
+        let after = second.snapshot.scan;
+        let compared = build(
+            &opened.backend,
+            before,
+            after,
+            Metric::Logical,
+            &QueryFilter::default(),
+            &Cancellation::new(),
+            &ComparisonProgress::default(),
+        )
+        .unwrap();
+        assert_eq!(compared.root.logical.net, Some(3));
+        let rankings = query(
+            &compared,
+            compared.root.id,
+            Ranking::GrowingDirectories,
+            None,
+        )
+        .unwrap();
+        let deep = rankings
+            .page
+            .entries
+            .iter()
+            .find(|row| {
+                row.after
+                    .as_ref()
+                    .is_some_and(|e| e.entry.display_name == "deep")
+            })
+            .unwrap();
+        let drilled = query(&compared, deep.id, Ranking::Hierarchy, None).unwrap();
+        assert_eq!(drilled.ancestors.len(), 3);
+        assert_eq!(drilled.ancestors.first().unwrap().0, compared.root.id);
+        assert_eq!(drilled.ancestors.last().unwrap().0, deep.id);
+        assert_eq!(drilled.page.entries.len(), 1);
+        let page = query(&compared, compared.root.id, Ranking::Hierarchy, None).unwrap();
+        let removed = page
+            .page
+            .entries
+            .iter()
+            .find(|row| {
+                row.before
+                    .as_ref()
+                    .is_some_and(|e| e.entry.display_name == "removed.txt")
+            })
+            .unwrap();
+        assert_eq!(removed.change, ChangeKind::Removed);
+        assert_eq!(
+            endpoint_path(
+                &opened.backend,
+                &compared,
+                removed.id,
+                ComparisonEndpoint::Before,
+                false
+            )
+            .unwrap(),
+            source.join("removed.txt")
+        );
+        assert!(
+            endpoint_path(
+                &opened.backend,
+                &compared,
+                removed.id,
+                ComparisonEndpoint::Before,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            endpoint_path(
+                &opened.backend,
+                &compared,
+                removed.id,
+                ComparisonEndpoint::After,
+                false
+            )
+            .is_err()
+        );
+        let cancel = Cancellation::new();
+        cancel.cancel();
+        assert!(
+            build(
+                &opened.backend,
+                before,
+                after,
+                Metric::Logical,
+                &QueryFilter::default(),
+                &cancel,
+                &ComparisonProgress::default()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            query(&compared, compared.root.id, Ranking::Hierarchy, None)
+                .unwrap()
+                .page
+                .entries
+                .len(),
+            3
+        );
+        drop(first);
+        drop(second);
+        assert!(remove_cached(&opened.backend, Some(before)).is_err());
+        drop(compared);
+        remove_cached(&opened.backend, Some(before)).unwrap();
+        assert_eq!(
+            std::fs::read(source.join("growth.txt")).unwrap(),
+            b"123456789"
+        );
     }
     #[test]
     fn filtered_hierarchy_largest_and_chart_share_charged_totals() {

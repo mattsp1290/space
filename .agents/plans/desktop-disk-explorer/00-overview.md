@@ -3,7 +3,7 @@
 ## Acceptance update — 2026-10-16
 Matt explicitly accepts passing CI as the current platform acceptance gate. Real desktop/laptop UI, GPU, accessibility and clean-machine checks are deferred follow-up validation, not blockers for G0 or subsequent feature work. Native-target CI must pass formatting, Clippy, tests, release builds, package assembly and extracted CLI smoke on all four targets. Do not describe this as observed GUI or real-hardware success. The detailed native procedures below remain the later validation checklist. License/distribution safeguards remain separate.
 
-Status: Ready. First work package: G0 platform feasibility; subsequent feature implementation depends on passing that gate. Planning only; no application implementation or native validation has occurred.
+Status: Ready. First work package: G0 platform feasibility; subsequent feature implementation depends on passing that gate. This is the approved implementation specification. At its original planning baseline, no application implementation or native validation had occurred. Read the repository README and current PR for implementation status; requirements below are not completion claims.
 
 ## Application context
 ```json
@@ -21,7 +21,7 @@ Status: Ready. First work package: G0 platform feasibility; subsequent feature i
 Matt confirmed no users, no backward compatibility, and no feature flags on 2026-10-16. Feature flags are therefore not applicable. He approved the proposed scope and permits GPL if needed. This does not itself change LICENSE. There is no existing application data to migrate; future schema evolution and crash recovery still need deliberate handling.
 
 ## Repository facts
-Baseline: 477d1571415ebff7556008dc4a90e51077f14a56 on main. Existing files: README.md ("Simple gui app to see what is taking space."), LICENSE (MIT), .gitignore (Rust template). No Cargo manifest, application, tests, CI, or repository AGENTS.md was present. Change type: greenfield cross-platform desktop product. All code paths and symbols below are proposed/new, not existing APIs. No external project request is needed: scanner, cache and UI are cohesive parts of this app, with no demonstrated independent consumer.
+Baseline: 477d1571415ebff7556008dc4a90e51077f14a56 on main. Existing files: README.md ("Simple gui app to see what is taking space."), LICENSE (MIT), .gitignore (Rust template). No Cargo manifest, application, tests, CI, or repository AGENTS.md was present. Change type: greenfield cross-platform desktop product. Code paths and symbols labeled proposed/new below were proposed at that baseline; consult the current source for the implemented APIs. No external project request is needed: scanner, cache and UI are cohesive parts of this app, with no demonstrated independent consumer.
 
 ## Approved product
 Rust + GPUI desktop application for Windows, macOS and Linux. Scan a selected drive or folder, persist the scan, browse a hierarchy, largest files and linked treemap, and filter cached metadata. Reopen disconnected-drive scans. Follow with a Changes view comparing two completed scans. Local-only operation, explicit coverage and stale state, read-only file inspection through copy/reveal. No content indexing or file deletion.

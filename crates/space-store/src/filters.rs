@@ -79,7 +79,7 @@ impl QueryFilter {
             && self.modified_after.is_none()
             && self.modified_before.is_none()
     }
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         if self
             .name
             .iter()
@@ -105,7 +105,7 @@ impl QueryFilter {
         }
         Ok(())
     }
-    fn folded(&self) -> Self {
+    pub(super) fn folded(&self) -> Self {
         let mut result = self.clone();
         result.name = self.name.as_deref().map(fold);
         result.path = self.path.as_deref().map(fold);
@@ -115,7 +115,7 @@ impl QueryFilter {
             .map(|s| fold(s.trim_start_matches('.')));
         result
     }
-    fn matches(&self, entry: &EntryRecord, path: &str, metric: Metric) -> bool {
+    pub(super) fn matches(&self, entry: &EntryRecord, path: &str, metric: Metric) -> bool {
         let name = fold(&entry.display_name);
         if self.name.as_ref().is_some_and(|n| !name.contains(n))
             || self.path.as_ref().is_some_and(|n| !fold(path).contains(n))
