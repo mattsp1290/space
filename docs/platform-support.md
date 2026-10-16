@@ -1,7 +1,8 @@
 # Native platform status
 
-Space is at **G0, a native feasibility bootstrap**, not a disk-explorer release.
-The scanner, persistence, complete browsing workflow and Changes are later work.
+Space has passed the G0 native CI gate and is implementing the
+[first scan/cache slice](scan-slice.md), not a disk-explorer release.
+Complete browsing, treemap, filters and Changes remain later work.
 A green compile or `--version` check is not a native-window, GPU or accessibility
 pass. No platform has completed the real-hardware checklist below.
 

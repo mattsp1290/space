@@ -10,6 +10,7 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
 gpui = { git = "https://github.com/zed-industries/zed", rev = "9f63850f7affbd57772a4f99554d4fd333b50a6f", default-features = false }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "9f63850f7affbd57772a4f99554d4fd333b50a6f", default-features = false, features = ["font-kit", "wayland", "x11"] }
 

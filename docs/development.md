@@ -1,7 +1,7 @@
-# Developing the G0 bootstrap
+# Developing Space
 
 The current implementation gate is full four-target native CI success, under
-the owner-approved 2026-10-16 [acceptance revision](platform-support.md). This is not yet a working disk scanner. No command below constitutes
+the owner-approved 2026-10-16 [acceptance revision](platform-support.md). The first scan/cache slice is described in [scan-slice.md](scan-slice.md). No command below constitutes
 proof of native UI behavior merely because it exits successfully.
 
 ## Prerequisites
@@ -98,13 +98,12 @@ to produce a green build.
 Local checks include shell syntax, workflow YAML parsing, the four-target matrix,
 and a dependency-inventory fixture. Linux archive assembly was tested with a
 synthetic C/ELF fixture in a temporary directory; this does not validate Space.
-Bootstrap checks reported formatting/diff success, three standalone probe logic
-tests, and zero-test runs for the placeholder crates. Full compilation/dependency
-inventory remain blocked by dependency fetching (HTTP CONNECT 403; offline
-metadata lacks accesskit_macos 0.26.3). Development-library installation was blocked
-by the read-only environment. Those local results assert no native Space build, package or GUI pass. Hosted
-CI build/package evidence is recorded separately in `platform-support.md`. Domain/scanner/store placeholders
-are not scanner correctness or persistence tests.
+G0 native CI passed all four targets at source commit
+`1fb9e0a0a3e7eef710411bcd18ea71f2ff93ec84` and documentation head
+`c93ff354b6847871cf1830741266a7cbfead509a`. Current scanner/store/core and
+headless backend tests run locally; full local GPUI compilation remains blocked
+by unavailable Fontconfig development metadata. No local GUI pass is claimed.
+New slice commits require fresh native CI validation.
 
 For eventual distribution, complete the license notice bundle and signing gates.
 See the platform document for required macOS Developer ID signing/notarization and

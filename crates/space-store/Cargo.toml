@@ -8,3 +8,9 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+space-core = { path = "../space-core" }
+rusqlite = { version = "=0.38.0", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

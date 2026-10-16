@@ -11,6 +11,10 @@ name = "space"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+space-core = { path = "../space-core" }
+space-scan = { path = "../space-scan" }
+space-store = { path = "../space-store" }
 gpui.workspace = true
 gpui_platform.workspace = true
 
