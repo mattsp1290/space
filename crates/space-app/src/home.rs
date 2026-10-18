@@ -212,6 +212,8 @@ pub fn render<T: 'static>(
     let l = layout(width, height, model.cards.len());
     let (primary, event, _) = model.primary();
     let hero = div()
+        .id("home-hero")
+        .debug_selector(|| "home-hero".into())
         .h(px(l.hero_height))
         .flex_shrink_0()
         .flex()
@@ -222,10 +224,11 @@ pub fn render<T: 'static>(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(6.))
+                .gap(px(4.))
                 .child(
                     div()
                         .text_size(px(theme::TEXT_2XL))
+                        .line_height(px(34.))
                         .child("What’s taking up space?"),
                 )
                 .child(
@@ -236,15 +239,22 @@ pub fn render<T: 'static>(
                         .child(action("scan-all", primary, event, model, true, cx, handler))
                         .child(model.status_line()),
                 )
-                .child(action(
-                    "refresh-disks",
-                    "Refresh disks",
-                    Event::RefreshDiscovery,
-                    model,
-                    false,
-                    cx,
-                    handler,
-                )),
+                .child(
+                    action(
+                        "refresh-disks",
+                        "Refresh disks",
+                        Event::RefreshDiscovery,
+                        model,
+                        false,
+                        cx,
+                        handler,
+                    )
+                    .h(px(14.))
+                    .py_0()
+                    .text_size(px(theme::TEXT_XS))
+                    .line_height(px(12.))
+                    .debug_selector(|| "home-refresh".into()),
+                ),
         )
         .child(action(
             "scan-folder",
@@ -267,9 +277,16 @@ pub fn render<T: 'static>(
         for card in chunk {
             let ticket = card.ticket;
             let enabled = model.allows(Event::Explore(ticket));
+            let first = model.cards.first().is_some_and(|c| c.ticket == ticket);
             let mut item = card_box(l.card_width)
                 .id(("disk", ticket.card.0))
-                .debug_selector(move || format!("disk-card-{}", ticket.card.0))
+                .debug_selector(move || {
+                    if first {
+                        "first-disk-card".into()
+                    } else {
+                        format!("disk-card-{}", ticket.card.0)
+                    }
+                })
                 .role(Role::Button)
                 .aria_label(format!("{}, {}, explore", card.name, card.status.label()))
                 .overflow_hidden()

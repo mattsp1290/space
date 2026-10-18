@@ -242,3 +242,23 @@ fn d6_disk_row_overlap_selects_only_disk() {
         assert!(!a.explore.disk_menu_open);
     });
 }
+
+#[test]
+fn home_refresh_fits_hero_above_cards_at_both_widths() {
+    let mut j = Journey::new(true);
+    for (width, height) in [(1280., 800.), (900., 600.)] {
+        j.visual().simulate_resize(size(px(width), px(height)));
+        j.settle();
+        j.frame();
+        let hero = j.visual().debug_bounds("home-hero").unwrap();
+        let refresh = j.visual().debug_bounds("home-refresh").unwrap();
+        let first = j.visual().debug_bounds("first-disk-card").unwrap();
+        assert_eq!(hero.size.height, px(112.));
+        assert!(refresh.origin.y >= hero.origin.y + px(12.));
+        assert!(
+            refresh.origin.y + refresh.size.height <= hero.origin.y + hero.size.height - px(12.)
+        );
+        assert!(refresh.origin.y + refresh.size.height <= first.origin.y);
+        assert!(refresh.origin.x + refresh.size.width <= hero.origin.x + hero.size.width);
+    }
+}
