@@ -12,7 +12,7 @@ use gpui::{
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     Role, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size, white,
+    actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use unicode_segmentation::*;
 
@@ -464,7 +464,10 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), rgb(0x64748b).into())
+            (
+                input.placeholder.clone(),
+                rgb(crate::theme::TEXT_MUTED).into(),
+            )
         } else {
             (content, style.color)
         };
@@ -544,7 +547,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3311ff30),
+                    rgba(crate::theme::SELECTION),
                 )),
                 None,
             )
@@ -656,17 +659,17 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .text_color(rgb(0x18212f))
-            .bg(rgb(0xeeeeee))
+            .text_color(rgb(crate::theme::TEXT))
+            .bg(rgb(crate::theme::SURFACE))
             .w_full()
             .overflow_hidden()
             .border_1()
             .border_color(if self.focus_handle.is_focused(window) {
-                rgb(0x427bd9)
+                rgb(crate::theme::ACCENT)
             } else if self.edit.limit_reached {
-                rgb(0x9c3900)
+                rgb(crate::theme::WARNING)
             } else {
-                rgb(0x999999)
+                rgb(crate::theme::BORDER)
             })
             .line_height(px(22.))
             .text_size(px(14.))
@@ -675,14 +678,14 @@ impl Render for TextInput {
                     .h(px(30.))
                     .w_full()
                     .p(px(4.))
-                    .bg(white())
+                    .bg(rgb(crate::theme::SURFACE))
                     .child(TextElement { input: cx.entity() }),
             )
             .when(self.edit.limit_reached, |field| {
                 field.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(0x9c3900))
+                        .text_color(rgb(crate::theme::WARNING))
                         .child("Input shortened to 64 KiB"),
                 )
             })

@@ -108,3 +108,22 @@ New slice commits require fresh native CI validation.
 For eventual distribution, complete the license notice bundle and signing gates.
 See the platform document for required macOS Developer ID signing/notarization and
 Windows signing status. These CI artifacts are development evidence, not releases.
+
+## Scan-and-treemap desktop acceptance
+
+Record M1–M7 with screenshots and timing in the PR; the GPUI in-process tests
+provide drawn-element evidence, while these checks use the native desktop.
+
+- M1: Home at 1280×800, one primary action, capacity cards and readable ≥11 px text.
+- M2: Scan all once; queued/scanning status, rising entry counts, automatic maps;
+  stop waits for acknowledgement and retains prior publications.
+- M3: Explore, hover tooltip, select, header zoom, Backspace, breadcrumbs, side
+  list sync, Largest paths, file-name search and clear.
+- M4: Sweep the map for ten seconds at 1280×800 and Retina fullscreen; no visible
+  stutter. Reduce the node budget and retest if needed.
+- M5: Resize to the 900×600 minimum; 260 px list, collapsed breadcrumbs, no overflow.
+- M6: Linux/Windows desktop checks remain deferred per platform-support.md;
+  all four native build/test jobs must pass on the exact PR head.
+- M7: On a real multi-million-entry main-disk scan, time complete Explore tree
+  queries at the root and largest depth-1 folder. Each must take ≤300 ms; lower
+  tree budgets and record them if necessary. Remove temporary instrumentation.

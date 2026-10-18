@@ -114,42 +114,58 @@ ranks, preserving stable ascending identity order without rescanning earlier tie
 Post-correction large-fixture measurements are pending.
 
 
-## Disk dashboard redesign
+## Scan-and-treemap redesign
 
-Space opens on All disks. Discovery reads mounted-target metadata without scanning
-source trees. Scan all disks freezes the current supported local target set and
-runs one metadata scanner at a time. Stop clears queued work and waits for the
-active worker acknowledgement; a publication that already committed stays valid.
-A failed target keeps its previous cached map and does not block later targets.
-Scan folder starts only after native root-identity preflight.
+Home discovers supported local disks without enumerating their contents. One
+primary action freezes the target set and runs the existing serial scan
+coordinator. Stop clears queued work and waits for the active worker. Failed or
+cancelled scans retain their previous publication. Saved offline sources remain
+browsable; capacity is OS metadata, separate from observed bytes.
 
-Cards show at most eight targets per page, in at most two columns, with explicit
-page access. Only the visible cards load bounded cached previews and hold their
-preview pins. Each preview contains the top 100 immediate children plus exact
-Other weight. This matches the explorer page budget. Unknown and zero-size data
-remain labeled; maps never claim to explain OS used/free capacity. Dashboard map
-actions open the unfiltered cached scope; existing filter inputs remain drafts.
+Home renders a scrolling grid with up to 24 nested previews. Cards beyond the cap
+retain publication metadata and open through a worker that lazily pins their
+exact scan. Only the explored card retains an extra snapshot outside that cap.
+Explore has a 44 px top bar, 36 px breadcrumb bar and 40 px details strip. The map
+measures 964×664 at 1280×800 with the 300 px side list visible. The list narrows to
+260 px at the 900×600 minimum. Folder headers zoom; tile bodies select. Backspace,
+Alt+Up, breadcrumbs and Enter provide keyboard navigation. Largest files are
+restricted to the current subtree. File-name search keeps ancestors of matching
+files and rebuilds its filtered session when the metric changes.
 
-The explorer uses a sidebar, breadcrumbs and a large resizable map, with the list,
-filters and inspector available on demand. Narrow windows retain item details and
-alias controls in a separately scrolling inline panel. Moving between disks
-preserves same-scan navigation; a replacement scan resets invalid node selection.
-Filtered disk switches commit the foreground card and cached snapshot together.
-Cancelled or failed filter work leaves the previous foreground identity intact.
-Cache removal returns Home before loading remaining metadata.
+Tree assembly uses per-call reader locks, a largest-directory-first queue and
+cancellation checks between calls. `TreeBudget::EXPLORE` is 48 root children,
+16 children per expansion, depth 3, 0.005 scope fraction, 600 nodes and 64 calls.
+`PREVIEW` is 24/8/depth 2/0.02/160 nodes/16 calls. A measured geometry cache avoids
+relayout on hover. Nested event listeners stop propagation and carry the rendered
+card, scan and query generation. Publication, disk switches and search epochs
+cannot commit stale work. Dropped SQLite/filter resources retire on workers.
 
-Discovery is best-effort, especially on macOS and Windows. Offline saved roots
-remain browsable but are not included in Scan all disks. No automatic privilege
-escalation, network traversal, source deletion, or background autoscan is added.
-Native GUI interaction and physical-device behavior still require later hardware
-checks; compiled GPUI element/style tests are not rendered-screen evidence.
+Removed app surfaces: Changes, cache management/diagnostics, hardlink aliases and
+the seven-field filter panel. Store comparison APIs remain library-only; schema
+version 3 and scanner/store/core are unchanged.
 
-Local redesign verification: 95 app tests compile and run against the actual pinned
-GPUI crate using its in-process test platform. Nine of these construct the real
-Space entity and exercise production asynchronous events with temporary SQLite
-caches: filtered navigation success/cancel/failure, stale completion, Home intent,
-page/selection restoration, offline card actions, cache removal/reload, and
-background publications. Domain tests pass separately (34 core, 28 scanner, 71
-store; five explicit benchmarks ignored). Independent identity/queue and UI-journey
-reviews precede publication. Full native launcher/build/package verification is
-still the exact-head CI gate, rather than something this harness establishes.
+Local tests: 65 app tests (including 17 real-entity journey/drawn tests), 34 core,
+23 scanner and 71 store tests pass on macOS; five store benchmarks remain ignored.
+Headless journeys exercise scan-all through a fixture-only discovery seam, stop,
+bookmarks, offline/lazy navigation, pending scopes, search and stale callbacks.
+Drawn tests pump frames and deliver real mouse/keyboard events for map area,
+headers, nested selection, hover tooltips, disk-menu occlusion and stale-frame
+clicks. Native test-platform frame requests may draw during executor pumping;
+the stale-frame test therefore dispatches both native mouse events before pumping
+the executor. Manual desktop acceptance and exact-head four-target CI are separate
+gates, recorded in the PR evidence.
+
+T1 informational weight-weighted aspect means (`squarify` / inset layout):
+
+| Weights | 964×664 | 300×900 |
+|---|---|---|
+| 1,2,3,4,5 | 1.622 / 1.627 | 1.268 / 1.271 |
+| 50 Zipf | 1.279 / 1.283 | 1.266 / 1.272 |
+| 300 equal | 1.076 / 1.080 | 1.000 / 1.000 |
+| u64::MAX,1,0,7 | 1.990 / 1.453 | 3.260 / 3.013 |
+
+The owner approved a 4.0 mean limit only for the dominant-weight 300×900 case:
+its dominant tile necessarily approaches aspect 3. Other means must remain ≤2.5,
+and every tile holding ≥1% of weight must have aspect ≤4.0. Geometry also checks
+area, containment, overlap, deterministic sibling order, nesting, headers and
+hit-testing. No normalized stretching is used.

@@ -1,6 +1,7 @@
-//! Synchronous service boundary. Every function is called off the GPUI thread.
-#[path = "comparison_backend.rs"]
-pub mod comparison;
+#[path = "tree_query.rs"]
+mod tree_query;
+pub use tree_query::{TreeAbort, tree, tree_filtered};
+// Synchronous service boundary. Every function is called off the GPUI thread.
 use space_core::*;
 use space_store::{
     Cache, CacheReader, ChildrenSummary, FilteredView, Page, PageCursor, QueryFilter, RootRecord,
@@ -20,7 +21,6 @@ pub struct Backend {
     writer: Arc<Mutex<Cache>>,
     reader: Arc<Mutex<CacheReader>>,
     filter_reader: Arc<Mutex<CacheReader>>,
-    comparison_reader: Arc<Mutex<CacheReader>>,
 }
 pub type Result<T> = std::result::Result<T, String>;
 pub const PAGE_SIZE: usize = 100;
@@ -28,7 +28,6 @@ pub const PAGE_SIZE: usize = 100;
 pub struct Snapshot {
     pub root: RootRecord,
     pub scan: ScanId,
-    pub spec: ScanSpec,
     pub path: NativePath,
     pub interval: (Timestamp, Option<Timestamp>),
     pub root_entry: StoredEntry,
@@ -43,7 +42,6 @@ pub struct Opened {
 pub enum View {
     Folders,
     Largest,
-    Treemap,
 }
 #[derive(Clone)]
 pub struct Query {
@@ -100,7 +98,6 @@ fn timestamp() -> Result<Timestamp> {
 }
 fn snapshot(cache: &CacheReader, root: RootRecord, scan: ScanId) -> Result<Snapshot> {
     Ok(Snapshot {
-        spec: cache.spec(scan).map_err(error)?,
         path: cache.scan_path(scan).map_err(error)?,
         interval: cache.interval(scan).map_err(error)?,
         root_entry: cache.root_entry(scan).map_err(error)?,
@@ -113,7 +110,6 @@ pub fn open(directory: &Path) -> Result<Opened> {
     let cache = Cache::open(directory).map_err(error)?;
     let reader = cache.reader().map_err(error)?;
     let filter_reader = cache.reader().map_err(error)?;
-    let comparison_reader = cache.reader().map_err(error)?;
     let roots = published_roots(&reader)?;
     let mut latest = None;
     for root in &roots {
@@ -133,7 +129,6 @@ pub fn open(directory: &Path) -> Result<Opened> {
             writer: Arc::new(Mutex::new(cache)),
             reader: Arc::new(Mutex::new(reader)),
             filter_reader: Arc::new(Mutex::new(filter_reader)),
-            comparison_reader: Arc::new(Mutex::new(comparison_reader)),
         },
         roots,
         snapshot,
@@ -174,7 +169,8 @@ pub fn discovery(backend: &Backend) -> Result<(space_scan::VolumeListing, Vec<Ro
 /// Bounded cached child totals for an independently normalized dashboard map.
 /// Use the explorer page budget so every visible tile can be selected immediately;
 /// remaining child weight is represented by Other.
-pub fn preview(backend: &Backend, snapshot: &Snapshot, metric: Metric) -> Result<ChildrenSummary> {
+#[cfg(test)]
+fn preview(backend: &Backend, snapshot: &Snapshot, metric: Metric) -> Result<ChildrenSummary> {
     read(backend)?
         .children_summary(
             snapshot.scan,
@@ -215,7 +211,6 @@ pub fn filter(
 pub struct Queried {
     pub page: Page,
     pub current: StoredEntry,
-    pub summary: Option<ChildrenSummary>,
     pub display_paths: Vec<String>,
 }
 pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
@@ -226,12 +221,8 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
             .lock()
             .map_err(|_| "Filtered view lock poisoned")?;
         let current = view.entry(query.parent).map_err(error)?;
-        let summary = (query.view == View::Treemap)
-            .then(|| view.children_summary(query.parent, PAGE_SIZE))
-            .transpose()
-            .map_err(error)?;
         let page = match query.view {
-            View::Folders | View::Treemap => view.children(query.parent, query.cursor, PAGE_SIZE),
+            View::Folders => view.children(query.parent, query.cursor, PAGE_SIZE),
             View::Largest => view.largest(subtree, query.cursor, PAGE_SIZE),
         }
         .map_err(error)?;
@@ -243,18 +234,13 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
         return Ok(Queried {
             page,
             current,
-            summary,
             display_paths,
         });
     }
     let cache = read(backend)?;
     let current = cache.entry(query.scan, query.parent).map_err(error)?;
-    let summary = (query.view == View::Treemap)
-        .then(|| cache.children_summary(query.scan, query.parent, query.metric, PAGE_SIZE))
-        .transpose()
-        .map_err(error)?;
     let page = match query.view {
-        View::Folders | View::Treemap => cache.children_sorted(
+        View::Folders => cache.children_sorted(
             query.scan,
             query.parent,
             query.metric,
@@ -276,7 +262,6 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
     Ok(Queried {
         page,
         current,
-        summary,
         display_paths,
     })
 }
@@ -295,36 +280,6 @@ fn paths_for_page(
         })
         .collect()
 }
-pub struct Aliases {
-    pub entries: Vec<(NodeId, String)>,
-    pub next: Option<PageCursor>,
-}
-pub fn aliases(
-    backend: &Backend,
-    scan: ScanId,
-    node: NodeId,
-    cursor: Option<PageCursor>,
-) -> Result<Aliases> {
-    let reader = read(backend)?;
-    let page = reader.aliases(scan, node, cursor, 100).map_err(error)?;
-    let entries = page
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let path = reader
-                .native_path(scan, entry.node)
-                .map_err(error)?
-                .to_path_buf()
-                .map_err(error)?;
-            Ok((entry.node, path.to_string_lossy().into_owned()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Aliases {
-        entries,
-        next: page.next,
-    })
-}
-
 pub struct ScanRequest {
     pub path: PathBuf,
     pub cache_directory: PathBuf,
@@ -505,83 +460,6 @@ pub fn validated_reveal_path(
     Ok(path)
 }
 
-pub struct CacheRow {
-    pub info: space_store::ScanInfo,
-    pub path: NativePath,
-    pub totals: Option<StoredEntry>,
-}
-pub struct Inspection {
-    pub rows: Vec<CacheRow>,
-    pub next: Option<ScanId>,
-    pub footprint: space_store::CacheFootprint,
-    pub issues: Option<space_store::IssuePage>,
-}
-pub fn inspect_cache(
-    backend: &Backend,
-    before: Option<ScanId>,
-    selected: Option<ScanId>,
-    after: Option<i64>,
-) -> Result<Inspection> {
-    let cache = read(backend)?;
-    let page = cache.scans(before, 100).map_err(error)?;
-    let rows = page
-        .scans
-        .into_iter()
-        .map(|info| {
-            let scan = info.spec.key.id;
-            Ok(CacheRow {
-                path: cache.scan_path(scan).map_err(error)?,
-                totals: if info.status == ScanStatus::Published {
-                    Some(cache.root_entry(scan).map_err(error)?)
-                } else {
-                    None
-                },
-                info,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Inspection {
-        rows,
-        next: page.next,
-        footprint: cache.footprint().map_err(error)?,
-        issues: selected
-            .map(|scan| cache.issues(scan, after, 50))
-            .transpose()
-            .map_err(error)?,
-    })
-}
-pub struct Reloaded {
-    pub roots: Vec<RootRecord>,
-    pub snapshot: Option<Snapshot>,
-}
-pub fn reload(backend: &Backend) -> Result<Reloaded> {
-    let cache = read(backend)?;
-    let roots = published_roots(&cache)?;
-    let mut latest = None;
-    for root in &roots {
-        if let Some(scan) = cache.latest(root.id).map_err(error)?
-            && latest
-                .as_ref()
-                .is_none_or(|(_, previous): &(RootRecord, ScanId)| scan > *previous)
-        {
-            latest = Some((root.clone(), scan));
-        }
-    }
-    let snapshot = latest
-        .map(|(root, scan)| snapshot(&cache, root, scan))
-        .transpose()?;
-    Ok(Reloaded { roots, snapshot })
-}
-/// Caller must confirm this exact cache-only scope and release active view pins.
-pub fn remove_cached(backend: &Backend, scan: Option<ScanId>) -> Result<()> {
-    let mut cache = lock(backend)?;
-    match scan {
-        Some(scan) => cache.remove_scan(scan),
-        None => cache.clear_cache(),
-    }
-    .map_err(error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,164 +496,6 @@ mod tests {
         let paths: std::collections::HashSet<_> =
             fixtures.iter().map(|fixture| &fixture.0).collect();
         assert_eq!(paths.len(), fixtures.len());
-    }
-    #[test]
-    fn comparison_preserves_endpoint_paths_pins_and_cancelled_prior_view() {
-        use comparison::{Ranking, build, candidates, path as endpoint_path, query};
-        use space_store::{ComparisonEndpoint, ComparisonProgress};
-        let fixture = Fixture::new();
-        let source = fixture.0.join("source");
-        let directory = fixture.0.join("cache");
-        std::fs::create_dir(&source).unwrap();
-        std::fs::write(source.join("growth.txt"), b"123").unwrap();
-        std::fs::write(source.join("removed.txt"), b"12345").unwrap();
-        let opened = open(&directory).unwrap();
-        let first = scan(
-            &opened.backend,
-            ScanRequest {
-                path: source.clone(),
-                cache_directory: directory.clone(),
-                expected_root: None,
-                refresh_root: None,
-                generation: 1,
-            },
-            &Cancellation::new(),
-            &Progress::default(),
-        )
-        .unwrap()
-        .unwrap();
-        std::fs::write(source.join("growth.txt"), b"123456789").unwrap();
-        std::fs::remove_file(source.join("removed.txt")).unwrap();
-        std::fs::create_dir_all(source.join("nested/deep")).unwrap();
-        std::fs::write(source.join("nested/deep/new.txt"), b"12").unwrap();
-        let second = scan(
-            &opened.backend,
-            ScanRequest {
-                path: source.clone(),
-                cache_directory: directory,
-                expected_root: None,
-                refresh_root: Some(first.snapshot.root.clone()),
-                generation: 2,
-            },
-            &Cancellation::new(),
-            &Progress::default(),
-        )
-        .unwrap()
-        .unwrap();
-        let options = candidates(&opened.backend, &second.snapshot, None).unwrap();
-        assert_eq!(options.entries.len(), 1);
-        assert_eq!(options.entries[0].scan.spec.key.id, first.snapshot.scan);
-        assert_eq!(options.entries[0].path, first.snapshot.path);
-        assert!(options.entries[0].unavailable.is_none());
-        let before = first.snapshot.scan;
-        let after = second.snapshot.scan;
-        let compared = build(
-            &opened.backend,
-            before,
-            after,
-            Metric::Logical,
-            &QueryFilter::default(),
-            &Cancellation::new(),
-            &ComparisonProgress::default(),
-        )
-        .unwrap();
-        assert_eq!(compared.root.logical.net, Some(3));
-        let rankings = query(
-            &compared,
-            compared.root.id,
-            Ranking::GrowingDirectories,
-            None,
-        )
-        .unwrap();
-        let deep = rankings
-            .page
-            .entries
-            .iter()
-            .find(|row| {
-                row.after
-                    .as_ref()
-                    .is_some_and(|e| e.entry.display_name == "deep")
-            })
-            .unwrap();
-        let drilled = query(&compared, deep.id, Ranking::Hierarchy, None).unwrap();
-        assert_eq!(drilled.ancestors.len(), 3);
-        assert_eq!(drilled.ancestors.first().unwrap().0, compared.root.id);
-        assert_eq!(drilled.ancestors.last().unwrap().0, deep.id);
-        assert_eq!(drilled.page.entries.len(), 1);
-        let page = query(&compared, compared.root.id, Ranking::Hierarchy, None).unwrap();
-        let removed = page
-            .page
-            .entries
-            .iter()
-            .find(|row| {
-                row.before
-                    .as_ref()
-                    .is_some_and(|e| e.entry.display_name == "removed.txt")
-            })
-            .unwrap();
-        assert_eq!(removed.change, ChangeKind::Removed);
-        assert_eq!(
-            endpoint_path(
-                &opened.backend,
-                &compared,
-                removed.id,
-                ComparisonEndpoint::Before,
-                false
-            )
-            .unwrap(),
-            source.join("removed.txt")
-        );
-        assert!(
-            endpoint_path(
-                &opened.backend,
-                &compared,
-                removed.id,
-                ComparisonEndpoint::Before,
-                true
-            )
-            .is_err()
-        );
-        assert!(
-            endpoint_path(
-                &opened.backend,
-                &compared,
-                removed.id,
-                ComparisonEndpoint::After,
-                false
-            )
-            .is_err()
-        );
-        let cancel = Cancellation::new();
-        cancel.cancel();
-        assert!(
-            build(
-                &opened.backend,
-                before,
-                after,
-                Metric::Logical,
-                &QueryFilter::default(),
-                &cancel,
-                &ComparisonProgress::default()
-            )
-            .is_err()
-        );
-        assert_eq!(
-            query(&compared, compared.root.id, Ranking::Hierarchy, None)
-                .unwrap()
-                .page
-                .entries
-                .len(),
-            3
-        );
-        drop(first);
-        drop(second);
-        assert!(remove_cached(&opened.backend, Some(before)).is_err());
-        drop(compared);
-        remove_cached(&opened.backend, Some(before)).unwrap();
-        assert_eq!(
-            std::fs::read(source.join("growth.txt")).unwrap(),
-            b"123456789"
-        );
     }
     #[test]
     fn filtered_hierarchy_largest_and_chart_share_charged_totals() {
@@ -818,14 +538,19 @@ mod tests {
         let query_spec = Query {
             scan: done.snapshot.scan,
             parent: done.snapshot.root_entry.entry.node,
-            view: View::Treemap,
+            view: View::Folders,
             metric: Metric::Logical,
             cursor: None,
             subtree_only: true,
             filtered: Some(crate::deferred::Deferred::new(filtered.clone(), drop)),
         };
         let result = query(&opened.backend, query_spec.clone()).unwrap();
-        let summary = result.summary.unwrap();
+        let summary = filtered
+            .view
+            .lock()
+            .unwrap()
+            .children_summary(done.snapshot.root_entry.entry.node, PAGE_SIZE)
+            .unwrap();
         assert_eq!(summary.total_bytes, 8);
         assert_eq!(
             summary.other_bytes
@@ -868,38 +593,6 @@ mod tests {
             )
             .is_err()
         );
-    }
-    #[test]
-    fn cache_removal_refuses_pins_and_reloads_empty_without_source_changes() {
-        let fixture = Fixture::new();
-        let path = fixture.0.join("source");
-        let directory = fixture.0.join("cache");
-        std::fs::create_dir(&path).unwrap();
-        std::fs::write(path.join("file"), b"keep").unwrap();
-        let opened = open(&directory).unwrap();
-        let done = scan(
-            &opened.backend,
-            ScanRequest {
-                path: path.clone(),
-                cache_directory: directory,
-                expected_root: None,
-                refresh_root: None,
-                generation: 1,
-            },
-            &Cancellation::new(),
-            &Progress::default(),
-        )
-        .unwrap()
-        .unwrap();
-        let scan = done.snapshot.scan;
-        assert!(remove_cached(&opened.backend, Some(scan)).is_err());
-        drop(done);
-        remove_cached(&opened.backend, Some(scan)).unwrap();
-        let empty = reload(&opened.backend).unwrap();
-        assert!(empty.snapshot.is_none());
-        assert!(empty.roots.is_empty());
-        remove_cached(&opened.backend, None).unwrap();
-        assert_eq!(std::fs::read(path.join("file")).unwrap(), b"keep");
     }
     #[test]
     fn failed_traversal_is_not_reported_as_cancellation() {
@@ -1256,13 +949,6 @@ mod tests {
             validated_reveal_path(&opened.backend, &offline, offline.root_entry.entry.node)
                 .is_err()
         );
-        let scan = first.scan;
-        drop(snapshots);
-        assert!(remove_cached(&opened.backend, Some(scan)).is_err());
-        let root = offline.root.clone();
-        drop(offline);
-        remove_cached(&opened.backend, Some(scan)).unwrap();
-        assert!(open_scan(&opened.backend, root, scan).is_err());
         assert_eq!(
             std::fs::read(fixture.0.join("alpha-disconnected/alpha.txt")).unwrap(),
             b"123"
