@@ -2,6 +2,7 @@ mod backend;
 mod dashboard_controller;
 mod deferred;
 mod disk_model;
+mod display_totals;
 mod explore;
 mod explore_controller;
 mod home;
@@ -18,6 +19,7 @@ mod ticket;
 mod tree;
 mod treemap_view;
 use backend::{Backend, Query, Snapshot, View};
+use display_totals::DisplayTotals;
 use gpui::{
     App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, KeyBinding, PathPromptOptions,
     Role, UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, prelude::*,
@@ -123,12 +125,10 @@ fn metric_label(metric: Metric) -> &'static str {
         "Allocated"
     }
 }
-fn total_text(row: &StoredEntry, metric: Metric) -> String {
-    tree::format_bytes(metric_bytes(row, metric))
-}
+
 impl Space {
     fn empty(cx: &mut Context<Self>) -> Self {
-        Self {
+        let mut app = Self {
             screen: Screen::Home,
             disks: Default::default(),
             explore: Default::default(),
@@ -150,16 +150,18 @@ impl Space {
             list_focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             status: String::new(),
-        }
-    }
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut app = Self::empty(cx);
-        app.disks.initializing = true;
-        window.focus(&app.focus, cx);
+        };
         app.search_subscription = Some(cx.subscribe(&app.search_input, |this, _, event, cx| {
             let text_input::TextInputEvent::Edited(text) = event;
             this.search_input_edited(text.clone(), cx);
         }));
+        app
+    }
+
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut app = Self::empty(cx);
+        app.disks.initializing = true;
+        window.focus(&app.focus, cx);
         app.initialize(cx);
         app
     }
@@ -242,7 +244,7 @@ impl Space {
         }
         let action = if self.explore.disk_menu_open {
             Action::ToggleDiskMenu
-        } else if !self.explore.search.text.is_empty()
+        } else if !self.search_input.read(cx).text().is_empty()
             && self.search_input.focus_handle(cx).is_focused(window)
         {
             Action::SearchClear
@@ -256,8 +258,7 @@ impl Space {
 }
 impl Render for Space {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.search_input.read(cx).text() != self.explore.search.text {
-            let text = self.explore.search.text.clone();
+        if let Some(text) = self.explore.search.input_reset.take() {
             self.search_input
                 .update(cx, |input, cx| input.set_text(&text, window, cx));
         }

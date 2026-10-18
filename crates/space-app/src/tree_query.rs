@@ -102,10 +102,12 @@ fn total(row: &StoredEntry, metric: Metric) -> MetricTotal {
 }
 fn node(row: StoredEntry, depth: u8, metric: Metric) -> TreeNode {
     let total = total(&row, metric);
+    let totals = crate::display_totals::DisplayTotals::from_entry(&row);
     TreeNode {
         node: row.entry.node,
         label: row.entry.display_name,
         bytes: total.observed_bytes,
+        totals,
         unknown_count: total.unknown_count,
         is_directory: row.entry.kind == EntryKind::Directory,
         depth,

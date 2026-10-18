@@ -50,6 +50,13 @@ fn dispatch<T: 'static>(
 ) {
     let _ = entity.update(cx, |this, cx| handler(this, event, window, cx));
 }
+fn other_caption(parent: NodeId, root: NodeId, count: u64) -> String {
+    if parent == root {
+        format!("{count} more items")
+    } else {
+        "More items; open to browse".into()
+    }
+}
 fn tile_box(rect: Rect, origin: Rect) -> Div {
     div()
         .absolute()
@@ -295,14 +302,7 @@ pub fn render<T: 'static>(
                         )
                     })
                     .unwrap_or_default(),
-                Target::Other { parent } => format!(
-                    "{} more items",
-                    if parent == tree.root {
-                        tree.other_count
-                    } else {
-                        tree.find(parent).map_or(0, |n| n.other_count)
-                    }
-                ),
+                Target::Other { parent } => other_caption(parent, tree.root, tree.other_count),
             };
             root = root.child(
                 div()
@@ -356,5 +356,14 @@ mod tests {
         assert_eq!(style.size.width, Some(px(0.1).into()));
         assert_eq!(style.border_widths.left, None);
         assert_eq!(style.padding.left, None);
+    }
+    #[test]
+    fn review_other_caption_preserves_count_uncertainty() {
+        let root = NodeId::new(1).unwrap();
+        assert_eq!(other_caption(root, root, 89), "89 more items");
+        assert_eq!(
+            other_caption(NodeId::new(2).unwrap(), root, 1),
+            "More items; open to browse"
+        );
     }
 }

@@ -5,6 +5,7 @@ use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicU64};
 #[derive(Default)]
 pub(super) struct SearchState {
     pub text: String,
+    pub input_reset: Option<String>,
     pub epoch: u64,
     pub debounce: Option<gpui::Task<()>>,
     pub session: Option<deferred::Deferred<backend::Filtered>>,
@@ -22,7 +23,7 @@ pub(super) struct PendingScope {
 }
 pub(super) struct State {
     pub snapshot: Option<Arc<Snapshot>>,
-    pub crumbs: Vec<(NodeId, String, u128)>,
+    pub crumbs: Vec<(NodeId, String, DisplayTotals)>,
     pub query_generation: u64,
     pub latest_generation: Arc<AtomicU64>,
     pub tree: Option<Arc<tree::Tree>>,
@@ -216,12 +217,7 @@ impl Space {
                             if let Some(node) = request.restore
                                 && this.explore_model().contains(node)
                             {
-                                this.explore.selected = Some(node);
-                                this.explore.list_selected = this
-                                    .explore
-                                    .list_rows
-                                    .iter()
-                                    .position(|r| r.entry.node == node);
+                                this.select_node(Some(node), cx);
                             }
                         }
                         Err(error) => {
@@ -254,6 +250,7 @@ impl Space {
         self.clear_search_workers();
         self.explore.search.epoch += 1;
         self.explore.search.text.clear();
+        self.explore.search.input_reset = Some(String::new());
         self.explore.search.busy = false;
         self.explore.search.matching = None;
         self.explore.search.error = None;
@@ -360,7 +357,27 @@ impl Space {
         let Some(row) = model.node(node).filter(|n| n.is_directory) else {
             return;
         };
-        self.explore.crumbs.push((node, row.label, row.bytes));
+        let branch = self
+            .explore
+            .tree
+            .as_ref()
+            .and_then(|tree| tree.path_to(node))
+            .map(|path| {
+                path.into_iter()
+                    .map(|n| (n.node, n.label.clone(), n.totals))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                let totals = self
+                    .explore
+                    .list_rows
+                    .iter()
+                    .find(|r| r.entry.node == node)
+                    .map(DisplayTotals::from_entry)
+                    .expect("validated child directory");
+                vec![(node, row.label, totals)]
+            });
+        self.explore.crumbs.extend(branch);
         self.enter_scope(node, None, None, cx);
     }
     fn select_node(&mut self, node: Option<NodeId>, cx: &mut Context<Self>) {
@@ -649,7 +666,12 @@ impl Space {
                 .collect(),
             disk_menu_open: self.explore.disk_menu_open,
             name: card.map_or_else(|| "Saved scan".into(), |c| c.label.clone()),
-            crumbs: self.explore.crumbs.clone(),
+            crumbs: self
+                .explore
+                .crumbs
+                .iter()
+                .map(|(n, label, totals)| (*n, label.clone(), totals.bytes(self.metric)))
+                .collect(),
             scope_total: total,
             metric: self.metric,
             busy: self.acquisition_busy(),

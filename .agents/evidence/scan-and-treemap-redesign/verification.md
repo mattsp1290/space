@@ -6,7 +6,7 @@ Baseline: main fast-forwarded to `1688e30d100120a3297eca41bf5496cc9685997c` with
 ## Automated evidence
 
 - Tree geometry/assembly tests pass, including the owner-approved T1 exception.
-- 65 app tests pass; 17 real-entity journey/drawn tests cover scan-all, stop,
+- 70 app tests pass; 21 real-entity journey/drawn tests cover scan-all, stop,
   three-level drill-in, map area, deepest hover/selection, stale-frame events,
   search epochs, metric rebuild, bookmarks, lazy opening, preview pins and rescan.
 - Core: 34 passed; scanner: 23 passed on macOS; store: 71 passed, 5 benchmarks ignored.
@@ -29,3 +29,5 @@ Baseline: main fast-forwarded to `1688e30d100120a3297eca41bf5496cc9685997c` with
 - M7: pending a published real multi-million-entry scan and whole-query timings.
 
 No native or CI result is implied by the drawn in-process tests.
+
+Standard dual review: both REQUEST_CHANGES; canonical auto fixer addressed six Important findings and one deduplicated suggestion. Full local fmt/Clippy/workspace tests/release build/diff gates passed after fixes. Deferred scan coordinator follow-up: https://github.com/mattsp1290/space/issues/2.

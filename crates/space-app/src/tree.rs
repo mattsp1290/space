@@ -34,6 +34,7 @@ pub struct TreeNode {
     pub node: NodeId,
     pub label: String,
     pub bytes: u64,
+    pub totals: crate::display_totals::DisplayTotals,
     pub unknown_count: u64,
     pub is_directory: bool,
     pub depth: u8,
@@ -67,6 +68,22 @@ impl Tree {
             })
         }
         find(&self.children, node)
+    }
+    /// Root-exclusive ancestry for a directory visible in the bounded tree.
+    pub fn path_to(&self, node: NodeId) -> Option<Vec<&TreeNode>> {
+        fn walk(nodes: &[TreeNode], node: NodeId) -> Option<Vec<&TreeNode>> {
+            for candidate in nodes {
+                if candidate.node == node {
+                    return Some(vec![candidate]);
+                }
+                if let Some(mut path) = walk(&candidate.children, node) {
+                    path.insert(0, candidate);
+                    return Some(path);
+                }
+            }
+            None
+        }
+        walk(&self.children, node)
     }
     pub fn family_index(&self, node: NodeId) -> Option<usize> {
         self.children
@@ -482,6 +499,10 @@ mod tests {
             node: NodeId::new(id as u64).unwrap(),
             label: format!("node-{id}"),
             bytes,
+            totals: crate::display_totals::DisplayTotals {
+                logical: bytes.into(),
+                allocated: bytes.into(),
+            },
             unknown_count: 0,
             is_directory: false,
             depth: 1,

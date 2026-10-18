@@ -18,7 +18,7 @@ pub(super) struct CardData {
     pub(super) epoch: u64,
     metric: Option<Metric>,
     dated: String,
-    total: String,
+    total: Option<DisplayTotals>,
     partial: bool,
     error: Option<String>,
     pub(super) opening: bool,
@@ -27,7 +27,7 @@ pub(super) struct CardData {
 #[derive(Clone)]
 pub(super) struct Bookmark {
     pub scan: ScanId,
-    pub crumbs: Vec<(NodeId, String, u128)>,
+    pub crumbs: Vec<(NodeId, String, DisplayTotals)>,
     pub selected: Option<NodeId>,
     pub list_mode: explore::ListMode,
 }
@@ -111,7 +111,6 @@ impl Space {
             return;
         }
         self.disks.metadata_busy = true;
-        let metric = self.metric;
         let revision = self.disks.revision;
         let task = cx.background_executor().spawn(async move {
             jobs.into_iter()
@@ -120,7 +119,7 @@ impl Space {
                         (
                             snapshot.scan,
                             date(snapshot.interval.1.unwrap_or(snapshot.interval.0)),
-                            total_text(&snapshot.root_entry, metric),
+                            DisplayTotals::from_entry(&snapshot.root_entry),
                             partial(&snapshot),
                         )
                     });
@@ -144,7 +143,7 @@ impl Space {
                         Ok((scan, dated, total, partial)) => {
                             data.scan = Some(scan);
                             data.dated = dated;
-                            data.total = total;
+                            data.total = Some(total);
                             data.partial = partial;
                         }
                         Err(error) => data.error = Some(error),
@@ -346,7 +345,7 @@ impl Space {
         data.epoch += 1;
         data.scan = Some(snapshot.scan);
         data.dated = date(snapshot.interval.1.unwrap_or(snapshot.interval.0));
-        data.total = total_text(&snapshot.root_entry, self.metric);
+        data.total = Some(DisplayTotals::from_entry(&snapshot.root_entry));
         data.partial = partial(&snapshot);
         data.preview = None;
         data.metric = None;
@@ -380,6 +379,10 @@ impl Space {
         for (id, data) in &mut self.disks.cards {
             if !visible.contains(id) {
                 data.preview = None;
+                data.geometry.borrow_mut().take();
+                if self.screen != Screen::Explore || self.disks.selected != Some(*id) {
+                    data.snapshot = None;
+                }
                 data.metric = None;
                 data.epoch = data.epoch.wrapping_add(1);
             }
@@ -417,7 +420,7 @@ impl Space {
                 continue;
             }
             data.preview = None;
-            data.total = "Loading cached totals…".into();
+
             data.error = None;
             data.epoch = data.epoch.wrapping_add(1);
             self.disks.preview_queue.retain(|job| job.card != id);
@@ -474,7 +477,7 @@ impl Space {
                         Ok((snapshot, preview)) => {
                             data.scan = Some(snapshot.scan);
                             data.dated = date(snapshot.interval.1.unwrap_or(snapshot.interval.0));
-                            data.total = total_text(&snapshot.root_entry, key.metric);
+                            data.total = Some(DisplayTotals::from_entry(&snapshot.root_entry));
                             data.partial = partial(&snapshot);
                             data.snapshot = Some(Arc::new(snapshot));
                             data.preview = Some(preview);
@@ -483,7 +486,7 @@ impl Space {
                         }
                         Err(error) => {
                             data.error = Some(error);
-                            data.total = "Cached totals unavailable".into();
+
                             data.metric = Some(key.metric);
                         }
                     }
@@ -698,7 +701,7 @@ impl Space {
                 crumbs: vec![(
                     snapshot.root_entry.entry.node,
                     snapshot.root_entry.entry.display_name.clone(),
-                    metric_bytes(&snapshot.root_entry, self.metric),
+                    DisplayTotals::from_entry(&snapshot.root_entry),
                 )],
                 selected: None,
                 list_mode: explore::ListMode::Children,
@@ -805,7 +808,10 @@ impl Space {
                     last_scan: data
                         .filter(|d| !d.dated.is_empty())
                         .map(|d| d.dated.clone()),
-                    cached_total: data.map_or_else(|| "No scan yet".into(), |d| d.total.clone()),
+                    cached_total: data.and_then(|d| d.total).map_or_else(
+                        || "No scan yet".into(),
+                        |t| format!("{} observed", tree::format_bytes(t.bytes(self.metric))),
+                    ),
                     preview: data.and_then(|d| d.preview.clone()),
                     geometry: data.map(|d| d.geometry.clone()).unwrap_or_default(),
                     error: error.or_else(|| data.and_then(|d| d.error.clone())),

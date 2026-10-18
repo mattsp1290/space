@@ -213,14 +213,22 @@ fn button<T: 'static>(
     cx: &mut Context<T>,
     handler: fn(&mut T, Event, &mut Window, &mut Context<T>),
 ) -> gpui::Stateful<Div> {
+    let selector = match action {
+        Action::ToggleMetric => Some("explore-metric"),
+        Action::ToggleList => Some("explore-list-toggle"),
+        Action::Rescan | Action::Stop => Some("explore-acquisition"),
+        _ => None,
+    };
     let event = model.event(action);
     let enabled = model.allows(&event);
-    theme::button(id, label, enabled, false).on_click(cx.listener(move |this, _, window, cx| {
-        cx.stop_propagation();
-        if enabled {
-            handler(this, event.clone(), window, cx);
-        }
-    }))
+    theme::button(id, label, enabled, false)
+        .when_some(selector, |d, s| d.debug_selector(move || s.into()))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            if enabled {
+                handler(this, event.clone(), window, cx);
+            }
+        }))
 }
 pub struct Controls<'a> {
     pub search: &'a Entity<text_input::TextInput>,
@@ -275,8 +283,9 @@ pub fn render<T: 'static>(
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .text_size(px(theme::TEXT_XS))
-                .text_ellipsis()
+                .truncate()
                 .child(if model.search_busy {
                     "Searching…".into()
                 } else {

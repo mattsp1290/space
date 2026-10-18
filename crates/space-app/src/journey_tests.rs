@@ -181,7 +181,10 @@ fn j2_navigation_and_e4_up_restores_selection() {
     for node in nodes.into_iter().rev() {
         j.action(Action::Up);
         j.settle();
-        j.read(|a| assert_eq!(a.explore.selected, Some(node)));
+        j.read(|a| {
+            assert_eq!(a.explore.selected, Some(node));
+            assert_eq!(a.explore.selection_path.as_ref().map(|p| p.0), Some(node));
+        });
     }
 }
 impl Journey {
@@ -405,9 +408,13 @@ fn e10_pending_scope_replaced_and_released() {
         )
     });
     j.update(|app, _, cx| {
-        app.explore.crumbs.push((a, "a".into(), 0));
+        app.explore
+            .crumbs
+            .push((a, "a".into(), DisplayTotals::default()));
         app.enter_scope(a, None, None, cx);
-        app.explore.crumbs.push((b, "b".into(), 0));
+        app.explore
+            .crumbs
+            .push((b, "b".into(), DisplayTotals::default()));
         app.enter_scope(b, None, None, cx);
     });
     j.settle();
@@ -443,6 +450,7 @@ fn j5_bookmark_e5_list_sync_and_e4_crumb() {
     j.read(|a| {
         assert_eq!(a.explore.tree.as_ref().unwrap().root, node);
         assert_eq!(a.explore.selected, selected);
+        assert_eq!(a.explore.selection_path.as_ref().map(|p| p.0), selected);
     });
     let root = j.read(|a| a.explore.crumbs[0].0);
     j.action(Action::Crumb(root));
@@ -601,7 +609,7 @@ fn d7_preview_geometries_are_independent() {
 }
 #[test]
 fn h7_cards_beyond_preview_cap_open_and_release_previous_pin() {
-    let mut j = Journey::new(false);
+    let mut j = Journey::new(true);
     let mut roots = j.fixture.roots.clone();
     for i in 0..24 {
         let path = j.fixture.directory.join(format!("saved-{i}"));
@@ -628,6 +636,7 @@ fn h7_cards_beyond_preview_cap_open_and_release_previous_pin() {
         a.reconcile_disks(cx);
     });
     j.settle();
+    j.frame();
     let tickets = j.read(|a| {
         let m = a.home_model();
         assert_eq!(m.cards.len(), 26);
@@ -654,6 +663,68 @@ fn h7_cards_beyond_preview_cap_open_and_release_previous_pin() {
         assert!(a.disks.cards[&tickets[0].card].snapshot.is_none());
         assert!(a.disks.cards[&tickets[1].card].snapshot.is_some());
     });
+    let outside_root = j.read(|a| {
+        a.disks
+            .registry
+            .card(tickets[0].card)
+            .unwrap()
+            .root
+            .clone()
+            .unwrap()
+    });
+    let outside =
+        backend::open_scan(&j.fixture.backend, outside_root, tickets[0].scan.unwrap()).unwrap();
+    let expected = tree::format_bytes(metric_bytes(&outside.root_entry, Metric::Allocated));
+    j.action(Action::ToggleMetric);
+    j.settle();
+    j.read(|a| {
+        assert_eq!(
+            a.home_model()
+                .cards
+                .iter()
+                .find(|c| c.ticket.card == tickets[0].card)
+                .unwrap()
+                .cached_total,
+            format!("{expected} observed")
+        )
+    });
+    j.open(0);
+    j.frame();
+    let selected = j.ticket(0).card;
+    let displaced = j.ticket(1).card;
+    let roots = j.read(|a| a.roots.clone());
+    let volumes = roots
+        .iter()
+        .filter(|r| r.id != j.fixture.roots[0].id && r.id != j.fixture.roots[1].id)
+        .map(|r| space_scan::MountedVolume {
+            label: "Saved source".into(),
+            mount_path: r.path.clone(),
+            aliases: vec![],
+            identity: r.identity.clone(),
+            filesystem: "fixture".into(),
+            removable: None,
+            capacity: None,
+        })
+        .collect();
+    j.update(|a, _, cx| {
+        a.volumes.as_mut().unwrap().volumes = volumes;
+        a.reconcile_disks(cx);
+    });
+    j.settle();
+    j.read(|a| {
+        assert!(a.disks.cards[&selected].snapshot.is_some());
+        assert!(a.disks.cards[&displaced].snapshot.is_none());
+        let model = a.home_model();
+        for id in [selected, displaced] {
+            let card = model.cards.iter().find(|c| c.ticket.card == id).unwrap();
+            assert!(card.geometry.borrow().is_none());
+            assert!(card.preview.is_none());
+        }
+        assert_eq!(
+            a.explore.snapshot.as_ref().unwrap().scan,
+            j.fixture.scans[0]
+        );
+    });
 }
 #[test]
 fn e1_directory_only_in_list_can_zoom_and_largest_paths_are_scoped() {
@@ -678,4 +749,133 @@ fn e1_directory_only_in_list_can_zoom_and_largest_paths_are_scoped() {
         );
         assert!(a.explore.list_paths.iter().all(|p| p.contains("/a/")));
     });
+}
+#[test]
+fn review_ime_preedit_survives_parent_redraw_then_commits_once() {
+    use gpui::EntityInputHandler;
+    let mut j = Journey::new(true);
+    j.open(0);
+    j.frame();
+    let epoch = j.read(|a| a.explore.search.epoch);
+    j.update(|a, w, cx| {
+        let input = a.search_input.clone();
+        w.focus(&input.focus_handle(cx), cx);
+        input.update(cx, |input, cx| {
+            input.replace_and_mark_text_in_range(None, "とう", Some(2..2), w, cx)
+        });
+        cx.notify();
+    });
+    j.frame();
+    j.update(|a, w, cx| {
+        a.search_input.update(cx, |input, cx| {
+            assert_eq!(input.text(), "とう");
+            assert_eq!(input.marked_text_range(w, cx), Some(0..2));
+        });
+        assert!(a.explore.search.text.is_empty());
+    });
+    j.update(|a, w, cx| {
+        a.search_input
+            .update(cx, |input, cx| input.unmark_text(w, cx))
+    });
+    j.settle();
+    j.read(|a| {
+        assert_eq!(a.explore.search.text, "とう");
+        assert_eq!(a.explore.search.epoch, epoch + 1);
+    });
+    j.action(Action::SearchClear);
+    j.settle();
+    j.frame();
+    j.update(|a, w, cx| {
+        a.search_input.update(cx, |input, cx| {
+            assert!(input.text().is_empty());
+            assert!(input.marked_text_range(w, cx).is_none());
+        })
+    });
+}
+#[test]
+fn review_direct_nested_header_preserves_ancestors_and_up_path() {
+    let mut j = Journey::new(true);
+    j.open(0);
+    j.frame();
+    let (a, b) = j.read(|s| {
+        let a = s
+            .explore
+            .tree
+            .as_ref()
+            .unwrap()
+            .children
+            .iter()
+            .find(|n| n.label == "a")
+            .unwrap();
+        (
+            a.node,
+            a.children.iter().find(|n| n.label == "b").unwrap().node,
+        )
+    });
+    let p = j.tile_point(tree::Target::Node(b), true);
+    j.visual().simulate_click(p, Default::default());
+    j.settle();
+    j.frame();
+    j.read(|s| {
+        assert_eq!(s.explore.crumbs.len(), 3);
+        assert_eq!(s.explore.crumbs[1].0, a);
+        assert_eq!(s.explore.crumbs[2].0, b);
+    });
+    j.action(Action::Up);
+    j.settle();
+    j.read(|s| {
+        assert_eq!(s.explore.tree.as_ref().unwrap().root, a);
+        assert_eq!(s.explore.selected, Some(b));
+        assert_eq!(s.explore.selection_path.as_ref().map(|p| p.0), Some(b));
+    });
+}
+#[test]
+fn review_metric_totals_survive_nested_bookmarks() {
+    let mut j = Journey::new(false);
+    j.open(0);
+    let node = j.node("a");
+    j.action(Action::ZoomInto(node));
+    j.settle();
+    let before = j.read(|a| a.explore_model().crumbs.clone());
+    j.action(Action::ToggleMetric);
+    j.settle();
+    let allocated = j.read(|a| {
+        let m = a.explore_model();
+        for (i, (_, _, bytes)) in m.crumbs.iter().enumerate() {
+            assert_eq!(*bytes, a.explore.crumbs[i].2.allocated);
+        }
+        assert!(m.crumbs.iter().zip(&before).any(|(a, b)| a.2 != b.2));
+        m.crumbs
+    });
+    j.open(1);
+    j.open(0);
+    j.read(|a| assert_eq!(a.explore_model().crumbs, allocated));
+}
+#[test]
+fn review_long_search_caption_keeps_minimum_window_controls_visible() {
+    let mut j = Journey::new(true);
+    j.open(0);
+    j.visual().simulate_resize(size(px(900.), px(600.)));
+    j.update(|a, _, cx| {
+        a.explore.search.text = "long-filename-".repeat(100);
+        a.explore.search.matching = Some(0);
+        a.metric = Metric::Allocated;
+        let mut listing = a.volumes.clone().unwrap();
+        listing.volumes[0].label = "Long disk name ".repeat(20);
+        a.volumes = Some(listing);
+        a.reconcile_disks(cx);
+    });
+    j.settle();
+    j.frame();
+    for selector in [
+        "explore-metric",
+        "explore-list-toggle",
+        "explore-acquisition",
+    ] {
+        let b = j.visual().debug_bounds(selector).unwrap();
+        assert!(
+            b.origin.x >= px(0.) && b.origin.x + b.size.width <= px(900.),
+            "{selector}: {b:?}"
+        );
+    }
 }
