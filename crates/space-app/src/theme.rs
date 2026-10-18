@@ -70,6 +70,63 @@ pub fn button(
         .focus(|d| d.border_1().border_color(rgb(ACCENT)))
         .child(label)
 }
+#[derive(Clone, Copy)]
+pub enum StatusKind {
+    Progress,
+    Warning,
+    Good,
+    Muted,
+}
+pub fn status_color(kind: StatusKind) -> u32 {
+    match kind {
+        StatusKind::Progress => ACCENT,
+        StatusKind::Warning => WARNING,
+        StatusKind::Good => SUCCESS,
+        StatusKind::Muted => TEXT_MUTED,
+    }
+}
+pub fn pill(label: impl Into<SharedString>, kind: StatusKind) -> Div {
+    div()
+        .flex_shrink_0()
+        .px(px(6.))
+        .py(px(2.))
+        .rounded(px(RADIUS_1))
+        .bg(rgb(SURFACE_RAISED))
+        .text_size(px(TEXT_XS))
+        .text_color(rgb(status_color(kind)))
+        .child(label.into())
+}
+pub fn text_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    enabled: bool,
+) -> Stateful<Div> {
+    button(id, label, enabled, false)
+        .bg(rgb(BG))
+        .text_color(rgb(TEXT_MUTED))
+}
+struct Tooltip(SharedString);
+impl gpui::Render for Tooltip {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        div()
+            .p(px(8.))
+            .rounded(px(RADIUS_1))
+            .bg(rgb(SURFACE_RAISED))
+            .text_color(rgb(TEXT))
+            .text_size(px(TEXT_XS))
+            .child(self.0.clone())
+    }
+}
+pub fn tooltip(
+    text: impl Into<SharedString>,
+) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView {
+    let text = text.into();
+    move |_, cx| cx.new(|_| Tooltip(text.clone())).into()
+}
 #[cfg(test)]
 mod tests {
     #[test]

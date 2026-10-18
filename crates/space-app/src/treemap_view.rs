@@ -133,15 +133,34 @@ impl<T: 'static> Frame<T> {
                 .top_0()
                 .left_0()
                 .w_full()
-                .h(px(tile.header.map_or(16., |h| h.height)))
+                .h(px(tile.header.map_or(
+                    if !tile.is_directory && tile.rect.height >= 34. {
+                        32.
+                    } else {
+                        16.
+                    },
+                    |h| h.height,
+                )))
                 .px(px(4.))
                 .text_size(px(theme::TEXT_XS))
-                .text_ellipsis()
-                .child(format!(
-                    "{} · {}",
-                    tile.label,
-                    tree::format_bytes(tile.bytes)
-                ));
+                .overflow_hidden()
+                .child(div().text_ellipsis().child(match target {
+                    Target::Other { parent } => format!(
+                        "Other · {} · {}",
+                        tree::format_bytes(tile.bytes),
+                        other_caption(parent, self.tree.root, self.tree.other_count)
+                    ),
+                    _ if tile.header.is_some() => {
+                        format!("{} · {}", tile.label, tree::format_bytes(tile.bytes))
+                    }
+                    _ => tile.label.clone(),
+                }))
+                .when(
+                    !tile.is_directory
+                        && !matches!(target, Target::Other { .. })
+                        && tile.rect.height >= 34.,
+                    |d| d.child(div().text_ellipsis().child(tree::format_bytes(tile.bytes))),
+                );
             if self.params.interactive
                 && tile.header.is_some()
                 && let Target::Node(n) = target
@@ -356,6 +375,8 @@ mod tests {
         assert_eq!(style.size.width, Some(px(0.1).into()));
         assert_eq!(style.border_widths.left, None);
         assert_eq!(style.padding.left, None);
+        assert_eq!(style.overflow.x, Some(gpui::Overflow::Hidden));
+        assert_eq!(style.overflow.y, Some(gpui::Overflow::Hidden));
     }
     #[test]
     fn review_other_caption_preserves_count_uncertainty() {

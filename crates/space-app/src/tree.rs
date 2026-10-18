@@ -587,6 +587,39 @@ mod tests {
                 assert!(dx.max(0.) * dy.max(0.) < 0.001);
             }
         }
+        // Account for one sibling level: nested areas are inside these parents.
+        let root_tiles = geometry
+            .tiles
+            .iter()
+            .filter(|t| t.parent == tree.root)
+            .collect::<Vec<_>>();
+        let weights = tree
+            .children
+            .iter()
+            .map(|n| u128::from(n.bytes))
+            .collect::<Vec<_>>();
+        let margins = squarify(&weights, bounds)
+            .iter()
+            .map(|r| {
+                r.area()
+                    - (r.width - LayoutParams::EXPLORE.gap).max(0.)
+                        * (r.height - LayoutParams::EXPLORE.gap).max(0.)
+            })
+            .sum::<f32>();
+        let accounted =
+            root_tiles.iter().map(|t| t.rect.area()).sum::<f32>() + margins + geometry.omitted_area;
+        assert!((accounted - bounds.area()).abs() <= bounds.area() * 0.01);
+        for parent in geometry.tiles.iter().filter(|t| !t.children.is_empty()) {
+            assert_eq!(
+                hit_test(&geometry, parent.body.x + 0.1, parent.body.y + 0.1)
+                    .map(|i| geometry.tiles[i].target),
+                Some(parent.target)
+            );
+            assert_eq!(
+                parent.header.unwrap().height,
+                LayoutParams::EXPLORE.header_height
+            );
+        }
         assert_eq!(hit_test(&geometry, -1., 0.), None);
         assert!(
             layout(&tree, Rect::default(), LayoutParams::EXPLORE)

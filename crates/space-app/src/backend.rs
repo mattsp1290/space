@@ -209,7 +209,11 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
         }
         .map_err(error)?;
         let display_paths = if query.view == View::Largest {
-            paths_for_page(&page, |node| view.native_path(node).map_err(error))?
+            paths_for_page(
+                &page,
+                view.native_path(query.parent).map_err(error)?,
+                |node| view.native_path(node).map_err(error),
+            )?
         } else {
             Vec::new()
         };
@@ -233,9 +237,11 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
     }
     .map_err(error)?;
     let display_paths = if query.view == View::Largest {
-        paths_for_page(&page, |node| {
-            cache.native_path(query.scan, node).map_err(error)
-        })?
+        paths_for_page(
+            &page,
+            cache.native_path(query.scan, query.parent).map_err(error)?,
+            |node| cache.native_path(query.scan, node).map_err(error),
+        )?
     } else {
         Vec::new()
     };
@@ -247,13 +253,15 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
 
 fn paths_for_page(
     page: &Page,
+    scope: NativePath,
     mut path: impl FnMut(NodeId) -> Result<NativePath>,
 ) -> Result<Vec<String>> {
+    let scope = scope.to_path_buf().map_err(error)?;
     page.entries
         .iter()
         .map(|row| {
-            path(row.entry.node)?
-                .to_path_buf()
+            let path = path(row.entry.node)?.to_path_buf().map_err(error)?;
+            path.strip_prefix(&scope)
                 .map(|p| p.to_string_lossy().into_owned())
                 .map_err(error)
         })

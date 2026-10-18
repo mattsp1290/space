@@ -7,8 +7,15 @@ pub const MAX_PREVIEWS: usize = 24;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Idle,
-    Queued,
-    Scanning { entries: u64 },
+    Queued {
+        position: usize,
+        total: usize,
+    },
+    Scanning {
+        entries: u64,
+        ordinal: usize,
+        total: usize,
+    },
     Stopping,
     Ready,
     Partial,
@@ -17,11 +24,22 @@ pub enum Status {
     Offline,
 }
 impl Status {
+    fn kind(&self) -> theme::StatusKind {
+        match self {
+            Self::Queued { .. } | Self::Scanning { .. } | Self::Stopping => {
+                theme::StatusKind::Progress
+            }
+            Self::Partial | Self::Failed | Self::Cancelled => theme::StatusKind::Warning,
+            Self::Ready => theme::StatusKind::Good,
+            Self::Idle | Self::Offline => theme::StatusKind::Muted,
+        }
+    }
+
     pub fn label(&self) -> String {
         match self {
-            Self::Scanning { entries } => format!("Scanning · {entries} entries"),
+            Self::Scanning { ordinal, total, .. } => format!("Scanning {ordinal}/{total}"),
             Self::Idle => "Not scanned".into(),
-            Self::Queued => "Queued".into(),
+            Self::Queued { position, total } => format!("Queued {position}/{total}"),
             Self::Stopping => "Stopping…".into(),
             Self::Ready => "Ready".into(),
             Self::Partial => "Partial".into(),
@@ -169,12 +187,20 @@ fn action<T: 'static>(
     handler: fn(&mut T, Event, &mut Window, &mut Context<T>),
 ) -> gpui::Stateful<Div> {
     let enabled = model.allows(event);
-    theme::button(id, label, enabled, primary).on_click(cx.listener(move |this, _, window, cx| {
+    (if primary {
+        theme::button(id, label, enabled, true)
+    } else {
+        theme::text_button(id, label, enabled)
+    })
+    .on_click(cx.listener(move |this, _, window, cx| {
         cx.stop_propagation();
         if enabled {
             handler(this, event, window, cx);
         }
     }))
+}
+fn card_box(width: f32) -> Div {
+    div().w(px(width)).flex_shrink_0()
 }
 pub fn render<T: 'static>(
     model: &Model,
@@ -209,7 +235,16 @@ pub fn render<T: 'static>(
                         .items_center()
                         .child(action("scan-all", primary, event, model, true, cx, handler))
                         .child(model.status_line()),
-                ),
+                )
+                .child(action(
+                    "refresh-disks",
+                    "Refresh disks",
+                    Event::RefreshDiscovery,
+                    model,
+                    false,
+                    cx,
+                    handler,
+                )),
         )
         .child(action(
             "scan-folder",
@@ -232,12 +267,11 @@ pub fn render<T: 'static>(
         for card in chunk {
             let ticket = card.ticket;
             let enabled = model.allows(Event::Explore(ticket));
-            let mut item = div()
+            let mut item = card_box(l.card_width)
                 .id(("disk", ticket.card.0))
+                .debug_selector(move || format!("disk-card-{}", ticket.card.0))
                 .role(Role::Button)
                 .aria_label(format!("{}, {}, explore", card.name, card.status.label()))
-                .w(px(l.card_width))
-                .flex_shrink_0()
                 .overflow_hidden()
                 .rounded(px(theme::RADIUS_3))
                 .bg(rgb(theme::SURFACE))
@@ -261,13 +295,18 @@ pub fn render<T: 'static>(
                         )
                         .child(
                             div()
-                                .text_color(rgb(if matches!(card.status, Status::Ready) {
-                                    theme::SUCCESS
-                                } else {
-                                    theme::ACCENT
-                                }))
-                                .text_size(px(theme::TEXT_XS))
-                                .child(card.status.label()),
+                                .flex()
+                                .flex_col()
+                                .items_end()
+                                .child(theme::pill(card.status.label(), card.status.kind()))
+                                .when_some(card.error.clone(), |d, error| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(theme::TEXT_XS))
+                                            .text_color(rgb(theme::WARNING))
+                                            .child(error),
+                                    )
+                                }),
                         ),
                 )
                 .child(
@@ -297,6 +336,7 @@ pub fn render<T: 'static>(
                             .rounded(px(3.))
                             .id(("capacity", ticket.card.0))
                             .aria_label("OS capacity, separate from observed sizes")
+                            .tooltip(theme::tooltip("OS capacity, separate from observed sizes"))
                             .child(
                                 div()
                                     .h_full()
@@ -315,9 +355,27 @@ pub fn render<T: 'static>(
                 .my(px(12.))
                 .overflow_hidden()
                 .rounded(px(theme::RADIUS_1));
-            item = item.child(if let Status::Scanning { entries } = card.status {
+            item = item.child(if let Status::Scanning { entries, .. } = card.status {
                 preview
                     .bg(rgb(theme::MAP_BG))
+                    .p(px(8.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .id(("scan-progress", ticket.card.0))
+                            .h(px(6.))
+                            .w_full()
+                            .flex()
+                            .children((0..16).map(|i| {
+                                div().flex_1().h_full().bg(rgb(if i % 2 == 0 {
+                                    theme::ACCENT
+                                } else {
+                                    theme::BORDER
+                                }))
+                            })),
+                    )
                     .child(format!("{entries} entries observed"))
             } else if let Some(tree) = &card.preview {
                 preview.child(treemap_view::render(
@@ -338,14 +396,6 @@ pub fn render<T: 'static>(
                         "Scan to build a map"
                     })
             });
-            if let Some(error) = &card.error {
-                item = item.child(
-                    div()
-                        .text_size(px(theme::TEXT_XS))
-                        .text_color(rgb(theme::WARNING))
-                        .child(error.clone()),
-                );
-            }
             let retry = matches!(card.status, Status::Failed | Status::Cancelled);
             item = item
                 .child(
@@ -422,15 +472,6 @@ pub fn render<T: 'static>(
             .px(px(24.))
             .py(px(8.))
             .text_size(px(theme::TEXT_XS))
-            .child(action(
-                "refresh-disks",
-                "Refresh disks",
-                Event::RefreshDiscovery,
-                model,
-                false,
-                cx,
-                handler,
-            ))
             .child(model.metric_label.clone())
             .when(!model.discovery_issues.is_empty(), |d| {
                 d.child(action(
@@ -491,6 +532,30 @@ mod tests {
         assert_eq!(m.status_line(), "Finding your disks…");
         m.unavailable = true;
         assert!(!m.allows(Event::ScanFolder));
+    }
+    #[test]
+    fn h5_card_dimensions_and_progress_labels() {
+        let width = layout(1280., 800., 2).card_width;
+        let mut card = card_box(width);
+        assert_eq!(card.style().size.width, Some(px(width).into()));
+        assert_eq!(card.style().flex_shrink, Some(0.));
+        assert_eq!(
+            Status::Queued {
+                position: 2,
+                total: 3
+            }
+            .label(),
+            "Queued 2/3"
+        );
+        assert_eq!(
+            Status::Scanning {
+                entries: 123,
+                ordinal: 1,
+                total: 3
+            }
+            .label(),
+            "Scanning 1/3"
+        );
     }
     #[test]
     fn h3_layout() {

@@ -101,8 +101,10 @@ synthetic C/ELF fixture in a temporary directory; this does not validate Space.
 G0 native CI passed all four targets at source commit
 `1fb9e0a0a3e7eef710411bcd18ea71f2ff93ec84` and documentation head
 `c93ff354b6847871cf1830741266a7cbfead509a`. Current scanner/store/core and
-headless backend tests run locally; full local GPUI compilation remains blocked
-by unavailable Fontconfig development metadata. No local GUI pass is claimed.
+headless backend tests ran locally during that original Linux bootstrap; its full
+local GPUI build was blocked by unavailable Fontconfig development metadata.
+The scan-and-treemap redesign additionally builds, packages and runs on the
+implementer's Apple Silicon macOS desktop; see its committed acceptance evidence.
 New slice commits require fresh native CI validation.
 
 For eventual distribution, complete the license notice bundle and signing gates.

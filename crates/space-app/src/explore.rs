@@ -49,6 +49,7 @@ pub struct Model {
     pub rows: Vec<ListRow>,
     pub list_selected: Option<usize>,
     pub has_next_page: bool,
+    pub on_later_page: bool,
     pub selection_path: Option<String>,
     pub status: Option<String>,
     pub new_scan_available: bool,
@@ -369,6 +370,18 @@ pub fn render<T: 'static>(
     for slot in slots {
         crumbs = match slot {
             CrumbSlot::Ellipsis => crumbs.child("…"),
+            CrumbSlot::Crumb(i) if i + 1 == model.crumbs.len() => {
+                let (_, label, bytes) = &model.crumbs[i];
+                crumbs.child(
+                    div()
+                        .w(px(crumb_width))
+                        .flex_shrink_0()
+                        .min_w_0()
+                        .text_ellipsis()
+                        .text_size(px(theme::TEXT_XS))
+                        .child(format!("{} {}", label, tree::format_bytes(*bytes))),
+                )
+            }
             CrumbSlot::Crumb(i) => {
                 let (n, label, bytes) = &model.crumbs[i];
                 crumbs.child(
@@ -400,18 +413,27 @@ pub fn render<T: 'static>(
                 cx,
                 handler,
             ))
-            .child(button(
-                "largest",
-                if model.list_mode == ListMode::Largest {
-                    "• Largest"
-                } else {
-                    "Largest"
-                },
-                Action::ListMode(ListMode::Largest),
-                model,
-                cx,
-                handler,
-            ));
+            .child(
+                button(
+                    "largest",
+                    if model.list_mode == ListMode::Largest {
+                        "• Largest"
+                    } else {
+                        "Largest"
+                    },
+                    Action::ListMode(ListMode::Largest),
+                    model,
+                    cx,
+                    handler,
+                )
+                .tooltip(theme::tooltip(format!(
+                    "Largest files under {}",
+                    model
+                        .crumbs
+                        .last()
+                        .map_or(model.name.as_str(), |c| c.1.as_str())
+                ))),
+            );
     }
     root = root.child(crumbs);
     let map = div()
@@ -564,32 +586,35 @@ pub fn render<T: 'static>(
                 .id("scope-list-container")
                 .role(Role::ListBox)
                 .child(div().flex_1().min_h_0().child(list))
-                .child(
-                    div()
-                        .flex()
-                        .child(button(
-                            "first-page",
-                            "First",
-                            Action::FirstPage,
-                            model,
-                            cx,
-                            handler,
-                        ))
-                        .child(button(
-                            "next-page",
-                            "Next",
-                            Action::NextPage,
-                            model,
-                            cx,
-                            handler,
-                        )),
-                ),
+                .when(model.has_next_page || model.on_later_page, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .child(button(
+                                "first-page",
+                                "First",
+                                Action::FirstPage,
+                                model,
+                                cx,
+                                handler,
+                            ))
+                            .child(button(
+                                "next-page",
+                                "Next",
+                                Action::NextPage,
+                                model,
+                                cx,
+                                handler,
+                            )),
+                    )
+                }),
         );
     }
     let selection = model.selected.and_then(|n| model.node(n));
     let caption = if let Some(row) = &selection {
         format!(
-            "{} · {} · {} · {} unknown · {}",
+            "{} {} · {} · {} · {} unknown · {}",
+            if row.is_directory { "▸" } else { "·" },
             row.label,
             tree::format_bytes(row.bytes),
             tree::percent(row.bytes, model.scope_total),
@@ -599,7 +624,10 @@ pub fn render<T: 'static>(
     } else {
         format!(
             "{} · {} · {} · Click to select · folder name to zoom · Backspace up",
-            model.name,
+            model
+                .crumbs
+                .last()
+                .map_or(model.name.as_str(), |c| c.1.as_str()),
             tree::format_bytes(model.scope_total),
             model.tree.as_ref().map_or_else(String::new, |t| format!(
                 "{} unknown · {} zero · {} nodes",
@@ -660,11 +688,10 @@ pub fn render<T: 'static>(
         details = details.child("Offline · saved scan");
     }
     if model.partial {
-        details = details.child(
-            div()
-                .text_color(rgb(theme::WARNING))
-                .child("Some locations could not be read"),
-        );
+        details = details.child(theme::pill(
+            "Some locations could not be read",
+            theme::StatusKind::Warning,
+        ));
     }
     root = root.child(details);
     if let Some(status) = model.search_error.as_ref().or(model.status.as_ref()) {
@@ -708,19 +735,22 @@ pub fn render<T: 'static>(
                 cx.listener(move |this, _, window, cx| handler(this, close.clone(), window, cx)),
             );
         for (i, disk) in model.disks.iter().enumerate() {
-            menu = menu.child(button(
-                ("choose-disk", i),
-                format!(
-                    "{} · {}{}",
-                    disk.name,
-                    disk.status,
-                    if disk.connected { "" } else { " · Offline" }
-                ),
-                Action::ChooseDisk(disk.ticket),
-                model,
-                cx,
-                handler,
-            ));
+            menu = menu.child(
+                button(
+                    ("choose-disk", i),
+                    format!(
+                        "{} · {}{}",
+                        disk.name,
+                        disk.status,
+                        if disk.connected { "" } else { " · Offline" }
+                    ),
+                    Action::ChooseDisk(disk.ticket),
+                    model,
+                    cx,
+                    handler,
+                )
+                .debug_selector(move || format!("disk-choice-{i}")),
+            );
         }
         root = root.child(menu);
     }

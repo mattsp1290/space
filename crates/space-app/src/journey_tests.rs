@@ -730,33 +730,6 @@ fn h7_cards_beyond_preview_cap_open_and_release_previous_pin() {
     j.read(|a| assert!(a.disks.cards[&selected].snapshot.is_none()));
 }
 #[test]
-fn e1_directory_only_in_list_can_zoom_and_largest_paths_are_scoped() {
-    let mut j = Journey::new(false);
-    j.open(0);
-    let node = j.node("a");
-    j.update(|a, _, _| {
-        let mut tree = a.explore.tree.as_ref().unwrap().as_ref().clone();
-        tree.children.retain(|n| n.node != node);
-        a.explore.tree = Some(Arc::new(tree));
-    });
-    j.action(Action::ZoomInto(node));
-    j.settle();
-    j.action(Action::ListMode(explore::ListMode::Largest));
-    j.settle();
-    j.read(|a| {
-        assert!(
-            a.explore
-                .list_rows
-                .iter()
-                .all(|r| r.entry.kind != EntryKind::Directory)
-        );
-        assert!(!a.explore.list_paths.is_empty());
-        assert!(a.explore.list_paths.iter().all(|p| {
-            std::path::Path::new(p).starts_with(j.fixture.directory.join("alpha").join("a"))
-        }));
-    });
-}
-#[test]
 fn review_ime_preedit_survives_parent_redraw_then_commits_once() {
     use gpui::EntityInputHandler;
     let mut j = Journey::new(true);
@@ -988,3 +961,5 @@ fn review_ancestor_totals_follow_search_replace_clear_and_bookmark() {
         }
     });
 }
+
+mod fidelity;

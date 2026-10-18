@@ -735,9 +735,17 @@ impl Space {
                     home::Status::Idle
                 };
                 let (status, error) = match self.disks.batch.status(card.id) {
-                    Some(CardStatus::Queued { .. }) => (home::Status::Queued, None),
-                    Some(CardStatus::Scanning { .. }) => (
+                    Some(CardStatus::Queued { ordinal, total }) => (
+                        home::Status::Queued {
+                            position: *ordinal,
+                            total: *total,
+                        },
+                        None,
+                    ),
+                    Some(CardStatus::Scanning { ordinal, total }) => (
                         home::Status::Scanning {
+                            ordinal: *ordinal,
+                            total: *total,
                             entries: self
                                 .running
                                 .as_ref()

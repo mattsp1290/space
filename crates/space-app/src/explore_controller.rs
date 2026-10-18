@@ -35,6 +35,7 @@ pub(super) struct State {
     pub list_rows: Vec<StoredEntry>,
     pub list_paths: Vec<String>,
     pub list_next: Option<PageCursor>,
+    pub list_later_page: bool,
     pub list_mode: ListMode,
     pub list_visible: bool,
     pub list_selected: Option<usize>,
@@ -63,6 +64,7 @@ impl Default for State {
             list_rows: vec![],
             list_paths: vec![],
             list_next: None,
+            list_later_page: false,
             list_mode: ListMode::Children,
             list_visible: true,
             list_selected: None,
@@ -109,6 +111,7 @@ impl Space {
         self.explore.list_rows.clear();
         self.explore.list_paths.clear();
         self.explore.list_next = None;
+        self.explore.list_later_page = false;
         self.explore.selected = None;
         self.explore.list_selected = None;
         self.explore.hovered = None;
@@ -227,6 +230,7 @@ impl Space {
                             this.explore.tree = Some(Arc::new(tree));
                             this.explore.list_rows = rows.page.entries;
                             this.explore.list_next = rows.page.next;
+                            this.explore.list_later_page = request.cursor.is_some();
                             this.explore.list_paths = rows.display_paths;
 
                             this.explore.tree_loading = false;
@@ -708,6 +712,7 @@ impl Space {
             rows,
             list_selected: self.explore.list_selected,
             has_next_page: self.explore.list_next.is_some(),
+            on_later_page: self.explore.list_later_page,
             selection_path: self.explore.selection_path.as_ref().map(|(_, p)| p.clone()),
             status: self.explore.status.clone(),
             new_scan_available: self.explore.new_scan_available.is_some(),
