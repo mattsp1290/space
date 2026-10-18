@@ -41,7 +41,7 @@ pub(super) struct State {
     pub selected: Option<NodeId>,
     pub hovered: Option<tree::Target>,
     pub selection_path: Option<(NodeId, String)>,
-    pub scope_entry: Option<StoredEntry>,
+
     pub disk_menu_open: bool,
     pub status: Option<String>,
     pub new_scan_available: Option<space_core::ScanId>,
@@ -69,7 +69,7 @@ impl Default for State {
             selected: None,
             hovered: None,
             selection_path: None,
-            scope_entry: None,
+
             disk_menu_open: false,
             status: None,
             new_scan_available: None,
@@ -113,7 +113,7 @@ impl Space {
         self.explore.list_selected = None;
         self.explore.hovered = None;
         self.explore.selection_path = None;
-        self.explore.scope_entry = None;
+
         self.explore.geometry.borrow_mut().take();
         self.explore.pending = None;
     }
@@ -188,7 +188,7 @@ impl Space {
                     },
                     metric,
                     cursor: work.cursor,
-                    subtree_only: true,
+
                     filtered: filtered.clone(),
                 },
             )?;
@@ -228,7 +228,7 @@ impl Space {
                             this.explore.list_rows = rows.page.entries;
                             this.explore.list_next = rows.page.next;
                             this.explore.list_paths = rows.display_paths;
-                            this.explore.scope_entry = Some(rows.current);
+
                             this.explore.tree_loading = false;
                             this.explore.status = None;
                             if let Some(node) = request.restore

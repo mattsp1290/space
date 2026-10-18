@@ -35,7 +35,6 @@ pub(super) struct Bookmark {
 struct PreviewJob {
     card: CardId,
     epoch: u64,
-    revision: u64,
     scan: Option<ScanId>,
     root: RootRecord,
     metric: Metric,
@@ -57,7 +56,6 @@ pub(super) struct State {
     metadata_busy: bool,
     preview_queue: VecDeque<PreviewJob>,
     preview_active: Option<PreviewJob>,
-    revision: u64,
     pub(super) open_request: u64,
     pub initializing: bool,
     pub notice: Option<String>,
@@ -111,7 +109,6 @@ impl Space {
             return;
         }
         self.disks.metadata_busy = true;
-        let revision = self.disks.revision;
         let task = cx.background_executor().spawn(async move {
             jobs.into_iter()
                 .map(|(id, root)| {
@@ -131,9 +128,6 @@ impl Space {
             let results = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.disks.metadata_busy = false;
-                if this.disks.revision != revision {
-                    return;
-                }
                 for (id, result) in results {
                     let data = this.disks.cards.entry(id).or_default();
                     if data.scan.is_some() {
@@ -331,16 +325,6 @@ impl Space {
         .detach();
     }
     fn publish_card(&mut self, card: CardId, snapshot: Snapshot, cx: &mut Context<Self>) {
-        let keep_snapshot = self.disks.selected == Some(card)
-            || self
-                .disks
-                .registry
-                .cards()
-                .iter()
-                .filter(|c| c.connected)
-                .chain(self.disks.registry.cards().iter().filter(|c| !c.connected))
-                .take(home::MAX_PREVIEWS)
-                .any(|c| c.id == card);
         let data = self.disks.cards.entry(card).or_default();
         data.epoch += 1;
         data.scan = Some(snapshot.scan);
@@ -350,43 +334,57 @@ impl Space {
         data.preview = None;
         data.metric = None;
         data.error = None;
-        data.snapshot = keep_snapshot.then(|| Arc::new(snapshot));
+        data.snapshot = Some(Arc::new(snapshot));
         if self.disks.selected == Some(card) && self.screen == Screen::Explore {
             self.explore.new_scan_available = data.scan;
         }
         self.reconcile_disks(cx); // Deliberately does not navigate or replace the foreground explorer.
     }
+    fn preview_ids(&self) -> Vec<CardId> {
+        self.disks
+            .registry
+            .cards()
+            .iter()
+            .filter(|c| c.connected)
+            .chain(self.disks.registry.cards().iter().filter(|c| !c.connected))
+            .take(home::MAX_PREVIEWS)
+            .map(|c| c.id)
+            .collect()
+    }
+    // The only owner of card retention: previews belong to the capped set,
+    // snapshots additionally belong to the current Explore foreground.
+    fn trim_card_resources(&mut self, previews: &[CardId]) {
+        let foreground = (self.screen == Screen::Explore)
+            .then_some(self.disks.selected)
+            .flatten();
+        for (id, data) in &mut self.disks.cards {
+            if !previews.contains(id) {
+                let displaced = data.preview.is_some()
+                    || data.geometry.borrow().is_some()
+                    || data.metric.is_some()
+                    || self
+                        .disks
+                        .preview_active
+                        .as_ref()
+                        .is_some_and(|job| job.card == *id && job.epoch == data.epoch);
+                data.preview = None;
+                data.geometry.borrow_mut().take();
+                data.metric = None;
+                if displaced {
+                    data.epoch = data.epoch.wrapping_add(1);
+                }
+                if foreground != Some(*id) {
+                    data.snapshot = None;
+                }
+            }
+        }
+    }
     pub(super) fn queue_visible_previews(&mut self, cx: &mut Context<Self>) {
         if self.backend.is_none() {
             return;
         }
-        let visible: Vec<_> = self
-            .disks
-            .registry
-            .cards()
-            .iter()
-            .filter(|card| card.connected)
-            .chain(
-                self.disks
-                    .registry
-                    .cards()
-                    .iter()
-                    .filter(|card| !card.connected),
-            )
-            .take(home::MAX_PREVIEWS)
-            .map(|card| card.id)
-            .collect();
-        for (id, data) in &mut self.disks.cards {
-            if !visible.contains(id) {
-                data.preview = None;
-                data.geometry.borrow_mut().take();
-                if self.screen != Screen::Explore || self.disks.selected != Some(*id) {
-                    data.snapshot = None;
-                }
-                data.metric = None;
-                data.epoch = data.epoch.wrapping_add(1);
-            }
-        }
+        let visible = self.preview_ids();
+        self.trim_card_resources(&visible);
         self.disks
             .preview_queue
             .retain(|job| visible.contains(&job.card));
@@ -404,10 +402,7 @@ impl Space {
                 continue;
             }
             if self.disks.preview_active.as_ref().is_some_and(|job| {
-                job.card == id
-                    && job.epoch == data.epoch
-                    && job.metric == self.metric
-                    && job.revision == self.disks.revision
+                job.card == id && job.epoch == data.epoch && job.metric == self.metric
             }) {
                 continue;
             }
@@ -427,7 +422,6 @@ impl Space {
             self.disks.preview_queue.push_back(PreviewJob {
                 card: id,
                 epoch: data.epoch,
-                revision: self.disks.revision,
                 scan: data.scan,
                 root,
                 metric: self.metric,
@@ -469,8 +463,7 @@ impl Space {
             let _ = this.update(cx, |this, cx| {
                 this.disks.preview_busy = false;
                 this.disks.preview_active = None;
-                if this.disks.revision == key.revision
-                    && let Some(data) = this.disks.cards.get_mut(&key.card)
+                if let Some(data) = this.disks.cards.get_mut(&key.card)
                     && data.epoch == key.epoch
                 {
                     match result {
@@ -615,18 +608,6 @@ impl Space {
                     list_mode: self.explore.list_mode,
                 },
             );
-            let retained = self
-                .disks
-                .registry
-                .cards()
-                .iter()
-                .filter(|c| c.connected)
-                .chain(self.disks.registry.cards().iter().filter(|c| !c.connected))
-                .take(home::MAX_PREVIEWS)
-                .any(|c| c.id == card);
-            if !retained && let Some(data) = self.disks.cards.get_mut(&card) {
-                data.snapshot = None;
-            }
         }
     }
     pub(super) fn open_card(&mut self, ticket: ticket::Ticket, cx: &mut Context<Self>) {
@@ -654,7 +635,6 @@ impl Space {
             return;
         };
         data.opening = true;
-        let revision = self.disks.revision;
         let request = self.disks.open_request;
         let task = cx
             .background_executor()
@@ -666,10 +646,7 @@ impl Space {
                     return;
                 };
                 data.opening = false;
-                if this.disks.revision != revision
-                    || data.scan != Some(scan)
-                    || this.disks.open_request != request
-                {
+                if data.scan != Some(scan) || this.disks.open_request != request {
                     cx.notify();
                     return;
                 }
@@ -711,6 +688,7 @@ impl Space {
         self.explore.new_scan_available = None;
         self.explore.disk_menu_open = false;
         self.enter_scope_from_bookmark(bookmark, cx);
+        self.trim_card_resources(&self.preview_ids());
     }
     pub(super) fn home_event(
         &mut self,

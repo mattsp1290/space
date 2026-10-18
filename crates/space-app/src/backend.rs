@@ -36,7 +36,6 @@ pub struct Snapshot {
 pub struct Opened {
     pub backend: Backend,
     pub roots: Vec<RootRecord>,
-    pub snapshot: Option<Snapshot>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
@@ -50,7 +49,6 @@ pub struct Query {
     pub view: View,
     pub metric: Metric,
     pub cursor: Option<PageCursor>,
-    pub subtree_only: bool,
     pub filtered: Option<crate::deferred::Deferred<Filtered>>,
 }
 #[derive(Default)]
@@ -111,19 +109,6 @@ pub fn open(directory: &Path) -> Result<Opened> {
     let reader = cache.reader().map_err(error)?;
     let filter_reader = cache.reader().map_err(error)?;
     let roots = published_roots(&reader)?;
-    let mut latest = None;
-    for root in &roots {
-        if let Some(scan) = cache.latest(root.id).map_err(error)?
-            && latest
-                .as_ref()
-                .is_none_or(|(_, previous): &(RootRecord, ScanId)| scan > *previous)
-        {
-            latest = Some((root.clone(), scan));
-        }
-    }
-    let snapshot = latest
-        .map(|(root, scan)| snapshot(&reader, root, scan))
-        .transpose()?;
     Ok(Opened {
         backend: Backend {
             writer: Arc::new(Mutex::new(cache)),
@@ -131,7 +116,6 @@ pub fn open(directory: &Path) -> Result<Opened> {
             filter_reader: Arc::new(Mutex::new(filter_reader)),
         },
         roots,
-        snapshot,
     })
 }
 pub fn open_root(backend: &Backend, root: RootRecord) -> Result<Snapshot> {
@@ -210,17 +194,15 @@ pub fn filter(
 }
 pub struct Queried {
     pub page: Page,
-    pub current: StoredEntry,
     pub display_paths: Vec<String>,
 }
 pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
-    let subtree = query.subtree_only.then_some(query.parent);
+    let subtree = Some(query.parent);
     if let Some(filtered) = &query.filtered {
         let view = filtered
             .view
             .lock()
             .map_err(|_| "Filtered view lock poisoned")?;
-        let current = view.entry(query.parent).map_err(error)?;
         let page = match query.view {
             View::Folders => view.children(query.parent, query.cursor, PAGE_SIZE),
             View::Largest => view.largest(subtree, query.cursor, PAGE_SIZE),
@@ -233,12 +215,10 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
         };
         return Ok(Queried {
             page,
-            current,
             display_paths,
         });
     }
     let cache = read(backend)?;
-    let current = cache.entry(query.scan, query.parent).map_err(error)?;
     let page = match query.view {
         View::Folders => cache.children_sorted(
             query.scan,
@@ -261,7 +241,6 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
     };
     Ok(Queried {
         page,
-        current,
         display_paths,
     })
 }
@@ -541,7 +520,7 @@ mod tests {
             view: View::Folders,
             metric: Metric::Logical,
             cursor: None,
-            subtree_only: true,
+
             filtered: Some(crate::deferred::Deferred::new(filtered.clone(), drop)),
         };
         let result = query(&opened.backend, query_spec.clone()).unwrap();
@@ -562,7 +541,7 @@ mod tests {
                     .sum::<u64>(),
             8
         );
-        assert_eq!(result.current.logical.observed_bytes, 8);
+        assert_eq!(filtered.root.logical.observed_bytes, 8);
         assert_eq!(result.page.entries[0].entry.display_name, "keep.txt");
         let largest = query(
             &opened.backend,
@@ -664,7 +643,7 @@ mod tests {
         std::fs::write(source.join("one.bin"), b"1234567").unwrap();
         std::fs::write(source.join("nested/two.bin"), b"12345").unwrap();
         let opened = open(&directory).unwrap();
-        assert!(opened.snapshot.is_none());
+        assert!(opened.roots.is_empty());
         let completed = scan(
             &opened.backend,
             ScanRequest {
@@ -708,7 +687,7 @@ mod tests {
                 view: View::Largest,
                 metric: Metric::Logical,
                 cursor: None,
-                subtree_only: false,
+
                 filtered: None,
             },
         )
@@ -730,7 +709,7 @@ mod tests {
         drop(opened);
         std::fs::rename(&source, fixture.0.join("disconnected")).unwrap();
         let reopened = open(&directory).unwrap();
-        let snapshot = reopened.snapshot.as_ref().unwrap();
+        let snapshot = &open_root(&reopened.backend, reopened.roots[0].clone()).unwrap();
         assert_eq!(snapshot.scan, scan_id);
         assert_eq!(snapshot.root_entry.logical.observed_bytes, 12);
         assert!(

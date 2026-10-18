@@ -188,7 +188,7 @@ impl Space {
                         })
                         .detach();
                 });
-                (backend, opened.roots, opened.snapshot)
+                (backend, opened.roots)
             })
         });
         cx.spawn(async move |this, cx| {
@@ -196,10 +196,9 @@ impl Space {
             let _ = this.update(cx, |this, cx| {
                 this.disks.initializing = false;
                 match result {
-                    Ok((backend, roots, snapshot)) => {
+                    Ok((backend, roots)) => {
                         this.backend = Some(backend);
                         this.roots = roots;
-                        drop(snapshot);
                         this.reconcile_disks(cx);
                         this.discover_disks(None,cx);
                         this.status =

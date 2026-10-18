@@ -725,6 +725,9 @@ fn h7_cards_beyond_preview_cap_open_and_release_previous_pin() {
             j.fixture.scans[0]
         );
     });
+    j.action(Action::Home);
+    j.settle();
+    j.read(|a| assert!(a.disks.cards[&selected].snapshot.is_none()));
 }
 #[test]
 fn e1_directory_only_in_list_can_zoom_and_largest_paths_are_scoped() {
