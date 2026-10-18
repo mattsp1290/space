@@ -115,6 +115,8 @@ Windows signing status. These CI artifacts are development evidence, not release
 
 Record M1–M7 with screenshots and timing in the PR; the GPUI in-process tests
 provide drawn-element evidence, while these checks use the native desktop.
+The redesign's [execution record](../.agents/evidence/scan-and-treemap-redesign/verification.md)
+links its desktop captures, review checkpoints and final PR results.
 
 - M1: Home at 1280×800, one primary action, capacity cards and readable ≥11 px text.
 - M2: Scan all once; queued/scanning status, rising entry counts, automatic maps;

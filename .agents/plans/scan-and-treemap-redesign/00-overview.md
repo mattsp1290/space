@@ -1,6 +1,6 @@
 # Scan-and-treemap redesign
 
-Status: Ready. Two independent reviews and one adversarial review completed; accepted findings are incorporated. This plan describes new work. No implementation has occurred.
+Status: Implemented on `feat/scan-and-treemap-redesign`; final independent code reviews approve. Execution evidence is in [verification.md](../../evidence/scan-and-treemap-redesign/verification.md) and [PR #3](https://github.com/mattsp1290/space/pull/3). The PR remains draft until M7 and exact-head native CI satisfy G3. The two independent and one adversarial planning reviews were completed before implementation.
 
 ## Application context
 
