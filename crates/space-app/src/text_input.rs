@@ -761,8 +761,9 @@ impl TextInput {
         &self.edit.content
     }
 
-    /// Programmatic reset; deliberately does not emit an Edited event.
-    pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Reset immediately so the next native edit sees the new buffer. The owner
+    /// notifies the platform when a Window is available. Does not emit Edited.
+    pub fn reset_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let (content, limit_reached) = single_line_limited(text, MAX_INPUT_BYTES);
         let end = content.len();
         self.edit = EditState {
@@ -774,7 +775,6 @@ impl TextInput {
         self.scroll_x = px(0.);
         self.is_selecting = false;
         self.last_layout = None;
-        window.notify_text_input_changed(&self.focus_handle);
         cx.notify();
     }
 

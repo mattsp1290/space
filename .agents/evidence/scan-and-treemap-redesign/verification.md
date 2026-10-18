@@ -6,7 +6,7 @@ Baseline: main fast-forwarded to `1688e30d100120a3297eca41bf5496cc9685997c` with
 ## Automated evidence
 
 - Tree geometry/assembly tests pass, including the owner-approved T1 exception.
-- 70 app tests pass; 21 real-entity journey/drawn tests cover scan-all, stop,
+- 72 app tests pass; 23 real-entity journey/drawn tests cover scan-all, stop,
   three-level drill-in, map area, deepest hover/selection, stale-frame events,
   search epochs, metric rebuild, bookmarks, lazy opening, preview pins and rescan.
 - Core: 34 passed; scanner: 23 passed on macOS; store: 71 passed, 5 benchmarks ignored.
@@ -31,3 +31,5 @@ Baseline: main fast-forwarded to `1688e30d100120a3297eca41bf5496cc9685997c` with
 No native or CI result is implied by the drawn in-process tests.
 
 Standard dual review: both REQUEST_CHANGES; canonical auto fixer addressed six Important findings and one deduplicated suggestion. Full local fmt/Clippy/workspace tests/release build/diff gates passed after fixes. Deferred scan coordinator follow-up: https://github.com/mattsp1290/space/issues/2.
+
+Standard verification review found three further Important edge cases. Fixed synchronous editor resets (deferred platform notification only), scope-guarded ancestor totals from the current filtered/unfiltered view, and native path ancestry assertions for Windows. New real-entity regressions cover edits/preedit before the next frame and filtered deep breadcrumbs through replacement, clearing, metric changes and bookmark switches.

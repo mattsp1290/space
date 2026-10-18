@@ -1,6 +1,6 @@
 #[path = "tree_query.rs"]
 mod tree_query;
-pub use tree_query::{TreeAbort, tree, tree_filtered};
+pub use tree_query::{TreeAbort, breadcrumb_totals, tree, tree_filtered};
 // Synchronous service boundary. Every function is called off the GPUI thread.
 use space_core::*;
 use space_store::{

@@ -144,7 +144,7 @@ Removed app surfaces: Changes, cache management/diagnostics, hardlink aliases an
 the seven-field filter panel. Store comparison APIs remain library-only; schema
 version 3 and scanner/store/core are unchanged.
 
-Local tests: 70 app tests (including 21 real-entity journey/drawn tests), 34 core,
+Local tests: 72 app tests (including 23 real-entity journey/drawn tests), 34 core,
 23 scanner and 71 store tests pass on macOS; five store benchmarks remain ignored.
 Headless journeys exercise scan-all through a fixture-only discovery seam, stop,
 bookmarks, offline/lazy navigation, pending scopes, search and stale callbacks.

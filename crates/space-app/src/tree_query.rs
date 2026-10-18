@@ -93,6 +93,39 @@ pub fn tree_filtered(
 ) -> Result<Option<Tree>> {
     assemble(&FilterSource(filtered), parent, metric, budget, abort)
 }
+/// Breadcrumbs describe the active view, including ancestors outside the current
+/// tree. Refresh them in the same worker publication as the map and side list.
+pub fn breadcrumb_totals(
+    backend: &Backend,
+    scan: ScanId,
+    filtered: Option<&Filtered>,
+    nodes: &[NodeId],
+    abort: &TreeAbort,
+) -> Result<Option<Vec<(NodeId, crate::display_totals::DisplayTotals)>>> {
+    let normal = Normal {
+        backend,
+        scan,
+        metric: Metric::Logical,
+    };
+    let filtered = filtered.map(FilterSource);
+    let source: &dyn Source = filtered
+        .as_ref()
+        .map_or(&normal as &dyn Source, |f| f as &dyn Source);
+    let mut totals = Vec::with_capacity(nodes.len());
+    for &node in nodes {
+        if abort.superseded() {
+            return Ok(None);
+        }
+        totals.push((
+            node,
+            crate::display_totals::DisplayTotals::from_entry(&source.entry(node)?),
+        ));
+    }
+    if abort.superseded() {
+        return Ok(None);
+    }
+    Ok(Some(totals))
+}
 fn total(row: &StoredEntry, metric: Metric) -> MetricTotal {
     if metric == Metric::Logical {
         row.logical

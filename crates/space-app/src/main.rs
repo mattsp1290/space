@@ -258,9 +258,8 @@ impl Space {
 }
 impl Render for Space {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(text) = self.explore.search.input_reset.take() {
-            self.search_input
-                .update(cx, |input, cx| input.set_text(&text, window, cx));
+        if std::mem::take(&mut self.explore.search.notify_input) {
+            window.notify_text_input_changed(&self.search_input.focus_handle(cx));
         }
         if self.screen == Screen::Explore && self.explore.focus_pending {
             if !self.search_input.focus_handle(cx).is_focused(window) {

@@ -747,7 +747,10 @@ fn e1_directory_only_in_list_can_zoom_and_largest_paths_are_scoped() {
                 .iter()
                 .all(|r| r.entry.kind != EntryKind::Directory)
         );
-        assert!(a.explore.list_paths.iter().all(|p| p.contains("/a/")));
+        assert!(!a.explore.list_paths.is_empty());
+        assert!(a.explore.list_paths.iter().all(|p| {
+            std::path::Path::new(p).starts_with(j.fixture.directory.join("alpha").join("a"))
+        }));
     });
 }
 #[test]
@@ -878,4 +881,107 @@ fn review_long_search_caption_keeps_minimum_window_controls_visible() {
             "{selector}: {b:?}"
         );
     }
+}
+#[test]
+fn review_reset_precedes_new_edit_and_preedit_before_next_frame() {
+    use gpui::EntityInputHandler;
+    for marked in [false, true] {
+        let mut j = Journey::new(true);
+        j.open(0);
+        j.frame();
+        j.update(|a, w, cx| {
+            let input = a.search_input.clone();
+            w.focus(&input.focus_handle(cx), cx);
+            a.clear_search(cx);
+            input.update(cx, |input, cx| {
+                if marked {
+                    input.replace_and_mark_text_in_range(None, "とう", Some(2..2), w, cx);
+                } else {
+                    input.replace_text_in_range(None, "alpha", w, cx);
+                }
+            });
+        });
+        j.frame();
+        j.settle();
+        j.update(|a, w, cx| {
+            let input = a.search_input.clone();
+            input.update(cx, |input, cx| {
+                assert_eq!(input.text(), if marked { "とう" } else { "alpha" });
+                if marked {
+                    assert_eq!(input.marked_text_range(w, cx), Some(0..2));
+                }
+            });
+            assert_eq!(a.explore.search.text, if marked { "" } else { "alpha" });
+        });
+    }
+}
+#[test]
+fn review_ancestor_totals_follow_search_replace_clear_and_bookmark() {
+    let mut j = Journey::new(false);
+    j.open(0);
+    let (b, expected) = j.read(|a| {
+        let tree = a.explore.tree.as_ref().unwrap();
+        let b = tree
+            .children
+            .iter()
+            .find(|n| n.label == "a")
+            .unwrap()
+            .children
+            .iter()
+            .find(|n| n.label == "b")
+            .unwrap()
+            .node;
+        let mut values = vec![(
+            tree.root,
+            DisplayTotals::from_entry(&a.explore.snapshot.as_ref().unwrap().root_entry),
+        )];
+        values.extend(
+            tree.path_to(b)
+                .unwrap()
+                .into_iter()
+                .map(|n| (n.node, n.totals)),
+        );
+        (b, values)
+    });
+    j.action(Action::SearchChanged("data-001".into()));
+    j.settle();
+    j.action(Action::ZoomInto(b));
+    j.settle();
+    let filtered = j.read(|a| a.explore.crumbs.clone());
+    assert_eq!(filtered.len(), 3);
+    assert!(
+        filtered
+            .iter()
+            .zip(&expected)
+            .all(|(c, e)| c.2.logical < e.1.logical)
+    );
+    j.action(Action::SearchChanged("data-002".into()));
+    j.settle();
+    j.read(|a| {
+        assert!(
+            a.explore
+                .crumbs
+                .iter()
+                .zip(&filtered)
+                .all(|(c, old)| c.2.logical != old.2.logical)
+        )
+    });
+    j.action(Action::SearchClear);
+    j.settle();
+    j.read(|a| {
+        for (crumb, (node, totals)) in a.explore.crumbs.iter().zip(&expected) {
+            assert_eq!(crumb.0, *node);
+            assert_eq!(crumb.2, *totals);
+        }
+    });
+    j.action(Action::ToggleMetric);
+    j.settle();
+    j.open(1);
+    j.open(0);
+    j.read(|a| {
+        for (crumb, (node, totals)) in a.explore_model().crumbs.iter().zip(&expected) {
+            assert_eq!(crumb.0, *node);
+            assert_eq!(crumb.2, totals.allocated);
+        }
+    });
 }

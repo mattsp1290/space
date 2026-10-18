@@ -5,7 +5,7 @@ use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicU64};
 #[derive(Default)]
 pub(super) struct SearchState {
     pub text: String,
-    pub input_reset: Option<String>,
+    pub notify_input: bool,
     pub epoch: u64,
     pub debounce: Option<gpui::Task<()>>,
     pub session: Option<deferred::Deferred<backend::Filtered>>,
@@ -153,6 +153,7 @@ impl Space {
         let filtered = self.explore.search.session.clone();
         let abort = backend::TreeAbort(self.explore.latest_generation.clone(), generation);
         let work = request.clone();
+        let ancestors = self.explore.crumbs.iter().map(|c| c.0).collect::<Vec<_>>();
         let task = cx.background_executor().spawn(async move {
             let tree = if let Some(filtered) = &filtered {
                 backend::tree_filtered(
@@ -188,10 +189,20 @@ impl Space {
                     metric,
                     cursor: work.cursor,
                     subtree_only: true,
-                    filtered,
+                    filtered: filtered.clone(),
                 },
             )?;
-            Ok(Some((tree, rows)))
+            let Some(totals) = backend::breadcrumb_totals(
+                &backend,
+                scan,
+                filtered.as_deref(),
+                &ancestors,
+                &abort,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some((tree, rows, totals)))
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -206,7 +217,13 @@ impl Space {
                     && this.screen == Screen::Explore
                 {
                     match result {
-                        Ok(Some((tree, rows))) => {
+                        Ok(Some((tree, rows, totals))) => {
+                            for (node, _, value) in &mut this.explore.crumbs {
+                                if let Some((_, totals)) = totals.iter().find(|(id, _)| id == node)
+                                {
+                                    *value = *totals;
+                                }
+                            }
                             this.explore.tree = Some(Arc::new(tree));
                             this.explore.list_rows = rows.page.entries;
                             this.explore.list_next = rows.page.next;
@@ -250,7 +267,9 @@ impl Space {
         self.clear_search_workers();
         self.explore.search.epoch += 1;
         self.explore.search.text.clear();
-        self.explore.search.input_reset = Some(String::new());
+        self.search_input
+            .update(cx, |input, cx| input.reset_text("", cx));
+        self.explore.search.notify_input = true;
         self.explore.search.busy = false;
         self.explore.search.matching = None;
         self.explore.search.error = None;
