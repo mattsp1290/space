@@ -12,10 +12,6 @@ impl<T: Send + Sync + 'static> Deferred<T> {
             retire: Arc::new(retire),
         }
     }
-    /// Only call inside an already-running background worker, before cache deletion.
-    pub fn close_on_worker(mut self) {
-        drop(self.value.take());
-    }
 }
 impl<T: Send + Sync + 'static> Clone for Deferred<T> {
     fn clone(&self) -> Self {

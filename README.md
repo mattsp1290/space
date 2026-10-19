@@ -2,25 +2,26 @@
 
 A local-only desktop disk explorer, being built in Rust with GPUI.
 
-## Current status: disk dashboard redesign
+## Current status: scan-and-treemap redesign
 
-Start on **All disks** and choose **Scan all disks** to scan the currently discovered
-local targets, one at a time. Each disk has its own cached treemap, capacity, scan
-status, and explicit Explore action. Scan folder handles a chosen local folder.
-The focused explorer keeps navigation, filters, aliases, and cached diagnostics
-available without stacking every control above the map. Space stores
-immutable results in SQLite and reopens them without rescanning, including when
-the source is disconnected. Browse size-sorted folders, subtree or root largest files,
-bounded treemaps, and explicit name/path/extension/size/time filters. Mounted-target
-selection, hardlink alias selection, and confirmed cache-only removal are included.
-Inspect cached diagnostics,
-switch logical/allocated metrics, cancel scans, copy paths, and reveal validated
-live paths. A previous snapshot stays available while a new scan runs.
+Space opens on **Home**. Choose **Scan all disks** once to scan discovered local
+sources serially, with progress and a nested mini map on each disk card. **Scan a
+folder…** handles a chosen local folder. Saved scans remain available offline.
 
-Changes compares compatible cached observations with before/after values,
-coverage-aware changes, and growth/decrease rankings. The preceding Changes
-revision `75b76ab` passed both complete five-job native CI runs; the dashboard
-redesign requires its own exact-revision validation.
+**Explore** puts a nested, squarified treemap below two thin bars. Click a tile to
+select it, click a folder header (or double-click its body) to zoom, and press
+Backspace or Alt+Up to go up. Breadcrumbs jump to an ancestor. The optional side
+list shows children or the largest files under the current scope. Name search
+matches **file names**, retaining their ancestor folders; it does not match folder
+names. Logical and allocated sizes, copy path, validated reveal, and rescan remain.
+A finished rescan offers **Show** without replacing the displayed snapshot.
+
+Changes, cache management/diagnostics, hardlink aliases, and the seven-field
+filter panel have been removed from the app. Comparison remains available only
+in the store library. To reset saved scans, quit Space and remove its cache
+directory (`~/Library/Application Support/Space` on macOS, `$XDG_DATA_HOME/Space`
+or `~/.local/share/Space` on Linux, `%LOCALAPPDATA%/Space` on Windows). Source files
+are never deleted by Space. The SQLite schema is unchanged.
 
 This is an early implementation, not a disk-explorer release. Root relinking and
 complete release validation remain unfinished. The CI matrix covers Linux, Windows and both macOS architectures. See [slice scope and limitations](docs/scan-slice.md).
@@ -32,7 +33,8 @@ results are not native GUI evidence. Every new source revision needs its own CI.
 - [Build and development commands](docs/development.md)
 - [Platform acceptance and blockers](docs/platform-support.md)
 - [Dependencies and license review](docs/dependencies.md)
-- [Dashboard design and acceptance](.agents/plans/disk-dashboard-redesign/00-overview.md)
+- [Scan-and-treemap design and acceptance](.agents/plans/scan-and-treemap-redesign/00-overview.md)
+- [Historical dashboard design and acceptance](.agents/plans/disk-dashboard-redesign/00-overview.md)
 - [Approved implementation plan](.agents/plans/desktop-disk-explorer/00-overview.md)
 
 Space's own code remains MIT licensed. Executable distribution is gated on

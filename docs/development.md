@@ -101,10 +101,33 @@ synthetic C/ELF fixture in a temporary directory; this does not validate Space.
 G0 native CI passed all four targets at source commit
 `1fb9e0a0a3e7eef710411bcd18ea71f2ff93ec84` and documentation head
 `c93ff354b6847871cf1830741266a7cbfead509a`. Current scanner/store/core and
-headless backend tests run locally; full local GPUI compilation remains blocked
-by unavailable Fontconfig development metadata. No local GUI pass is claimed.
+headless backend tests ran locally during that original Linux bootstrap; its full
+local GPUI build was blocked by unavailable Fontconfig development metadata.
+The scan-and-treemap redesign additionally builds, packages and runs on the
+implementer's Apple Silicon macOS desktop; see its committed acceptance evidence.
 New slice commits require fresh native CI validation.
 
 For eventual distribution, complete the license notice bundle and signing gates.
 See the platform document for required macOS Developer ID signing/notarization and
 Windows signing status. These CI artifacts are development evidence, not releases.
+
+## Scan-and-treemap desktop acceptance
+
+Record M1–M7 with screenshots and timing in the PR; the GPUI in-process tests
+provide drawn-element evidence, while these checks use the native desktop.
+The redesign's [execution record](../.agents/evidence/scan-and-treemap-redesign/verification.md)
+links its desktop captures, review checkpoints and final PR results.
+
+- M1: Home at 1280×800, one primary action, capacity cards and readable ≥11 px text.
+- M2: Scan all once; queued/scanning status, rising entry counts, automatic maps;
+  stop waits for acknowledgement and retains prior publications.
+- M3: Explore, hover tooltip, select, header zoom, Backspace, breadcrumbs, side
+  list sync, Largest paths, file-name search and clear.
+- M4: Sweep the map for ten seconds at 1280×800 and Retina fullscreen; no visible
+  stutter. Reduce the node budget and retest if needed.
+- M5: Resize to the 900×600 minimum; 260 px list, collapsed breadcrumbs, no overflow.
+- M6: Linux/Windows desktop checks remain deferred per platform-support.md;
+  all four native build/test jobs must pass on the exact PR head.
+- M7: On a real multi-million-entry main-disk scan, time complete Explore tree
+  queries at the root and largest depth-1 folder. Each must take ≤300 ms; lower
+  tree budgets and record them if necessary. Remove temporary instrumentation.
