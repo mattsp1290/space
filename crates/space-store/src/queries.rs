@@ -193,6 +193,9 @@ impl Cache {
         limit: usize,
     ) -> Result<Page> {
         self.ensure_published(scan)?;
+        if self.live_scan == Some(scan) && self.status(scan)? != ScanStatus::Published {
+            return Err(StoreError::Invalid("largest paths require a finished scan"));
+        }
         check_limit(limit)?;
         let (low, high) = match subtree {
             Some(node) => self.subtree_range(scan, node)?,
