@@ -212,7 +212,8 @@ impl Cache {
         })
     }
     /// `directory` must be a dedicated application cache directory. Never pass a
-    /// source folder. A corrupt/newer cache is reported and never replaced.
+    /// source folder. Detected corruption or a newer schema is reported without
+    /// replacing the cache. Opening does not perform a full integrity check.
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
         if !directory.exists() {
@@ -244,10 +245,6 @@ impl Cache {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 0 && version != 1 && version != 2 && version != schema::VERSION {
             return Err(StoreError::Schema(version));
-        }
-        let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-        if integrity != "ok" {
-            return Err(StoreError::Corrupt(integrity));
         }
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=FILE; PRAGMA cache_size=-8192;")?;
         if version == 0 {
