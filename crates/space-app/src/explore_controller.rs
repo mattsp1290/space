@@ -20,6 +20,7 @@ pub(super) struct PendingScope {
     pub parent: NodeId,
     pub restore: Option<NodeId>,
     pub cursor: Option<PageCursor>,
+    pub refresh: bool,
 }
 pub(super) struct State {
     pub snapshot: Option<Arc<Snapshot>>,
@@ -35,7 +36,7 @@ pub(super) struct State {
     pub list_rows: Vec<StoredEntry>,
     pub list_paths: Vec<String>,
     pub list_next: Option<PageCursor>,
-    pub list_later_page: bool,
+    pub list_cursor: Option<PageCursor>,
     pub list_mode: ListMode,
     pub list_visible: bool,
     pub list_selected: Option<usize>,
@@ -64,7 +65,7 @@ impl Default for State {
             list_rows: vec![],
             list_paths: vec![],
             list_next: None,
-            list_later_page: false,
+            list_cursor: None,
             list_mode: ListMode::Children,
             list_visible: true,
             list_selected: None,
@@ -111,7 +112,7 @@ impl Space {
         self.explore.list_rows.clear();
         self.explore.list_paths.clear();
         self.explore.list_next = None;
-        self.explore.list_later_page = false;
+        self.explore.list_cursor = None;
         self.explore.selected = None;
         self.explore.list_selected = None;
         self.explore.hovered = None;
@@ -135,6 +136,7 @@ impl Space {
             parent,
             restore,
             cursor,
+            refresh: false,
         };
         if self.explore.tree_busy {
             self.explore.pending = Some(request);
@@ -142,6 +144,48 @@ impl Space {
             self.start_scope(request, cx);
         }
         cx.notify();
+    }
+    pub(super) fn refresh_live_scope(&mut self, force: bool, cx: &mut Context<Self>) -> bool {
+        if self.screen != Screen::Explore || self.explore.snapshot.is_none() {
+            return false;
+        }
+        if self.explore.tree_busy && !force {
+            return false;
+        }
+        if self.explore.pending.is_some() && !force {
+            return false;
+        }
+        let pending = self.explore.pending.take();
+        let Some(parent) = pending
+            .as_ref()
+            .map(|p| p.parent)
+            .or_else(|| self.explore.crumbs.last().map(|c| c.0))
+        else {
+            return false;
+        };
+        self.explore.query_generation += 1;
+        self.explore
+            .latest_generation
+            .store(self.explore.query_generation, Ordering::Release);
+        let request = PendingScope {
+            generation: self.explore.query_generation,
+            parent,
+            restore: pending
+                .as_ref()
+                .map_or(self.explore.selected, |p| p.restore),
+            cursor: if force {
+                None
+            } else {
+                self.explore.list_cursor
+            },
+            refresh: pending.as_ref().is_none_or(|p| p.refresh),
+        };
+        if self.explore.tree_busy {
+            self.explore.pending = Some(request);
+        } else {
+            self.start_scope(request, cx);
+        }
+        true
     }
     fn start_scope(&mut self, request: PendingScope, cx: &mut Context<Self>) {
         let (Some(backend), Some(snapshot)) = (self.backend.clone(), self.explore.snapshot.clone())
@@ -158,47 +202,43 @@ impl Space {
         let work = request.clone();
         let ancestors = self.explore.crumbs.iter().map(|c| c.0).collect::<Vec<_>>();
         let task = cx.background_executor().spawn(async move {
-            let tree = if let Some(filtered) = &filtered {
-                backend::tree_filtered(
-                    filtered,
-                    work.parent,
-                    metric,
-                    tree::TreeBudget::EXPLORE,
-                    &abort,
-                )
-            } else {
-                backend::tree(
+            let query = Query {
+                scan,
+                parent: work.parent,
+                view: if mode == ListMode::Children {
+                    View::Folders
+                } else {
+                    View::Largest
+                },
+                metric,
+                cursor: work.cursor,
+                filtered: filtered.clone(),
+            };
+            let Some(filtered_view) = &filtered else {
+                return backend::scope(
                     &backend,
-                    scan,
-                    work.parent,
-                    metric,
+                    query,
                     tree::TreeBudget::EXPLORE,
+                    &ancestors,
                     &abort,
                 )
-            }?;
-            let Some(tree) = tree else {
+                .map(|result| result.map(|scope| (scope.tree, scope.rows, scope.totals)));
+            };
+            let Some(tree) = backend::tree_filtered(
+                filtered_view,
+                work.parent,
+                metric,
+                tree::TreeBudget::EXPLORE,
+                &abort,
+            )?
+            else {
                 return Ok::<_, String>(None);
             };
-            let rows = backend::query(
-                &backend,
-                Query {
-                    scan,
-                    parent: work.parent,
-                    view: if mode == ListMode::Children {
-                        View::Folders
-                    } else {
-                        View::Largest
-                    },
-                    metric,
-                    cursor: work.cursor,
-
-                    filtered: filtered.clone(),
-                },
-            )?;
+            let rows = backend::query(&backend, query)?;
             let Some(totals) = backend::breadcrumb_totals(
                 &backend,
                 scan,
-                filtered.as_deref(),
+                Some(filtered_view),
                 &ancestors,
                 &abort,
             )?
@@ -230,12 +270,29 @@ impl Space {
                             this.explore.tree = Some(Arc::new(tree));
                             this.explore.list_rows = rows.page.entries;
                             this.explore.list_next = rows.page.next;
-                            this.explore.list_later_page = request.cursor.is_some();
+                            this.explore.list_cursor = request.cursor;
                             this.explore.list_paths = rows.display_paths;
 
                             this.explore.tree_loading = false;
                             this.explore.status = None;
-                            if let Some(node) = request.restore
+                            if request.refresh {
+                                if this
+                                    .explore
+                                    .selected
+                                    .is_some_and(|n| !this.explore_model().contains(n))
+                                {
+                                    this.explore.selected = None;
+                                    this.explore.selection_path = None;
+                                }
+                                this.explore.list_selected =
+                                    this.explore.selected.and_then(|node| {
+                                        this.explore
+                                            .list_rows
+                                            .iter()
+                                            .position(|r| r.entry.node == node)
+                                    });
+                                this.explore.hovered = None;
+                            } else if let Some(node) = request.restore
                                 && this.explore_model().contains(node)
                             {
                                 this.select_node(Some(node), cx);
@@ -700,8 +757,25 @@ impl Space {
             busy: self.acquisition_busy(),
             stopping: self.disks.batch.stopping(),
             offline: card.is_some_and(|c| !c.connected),
+            live: self.explore.snapshot.as_ref().is_some_and(|s| s.live),
+            live_running: self.explore.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.live
+                    && self.running.as_ref().is_some_and(|_| {
+                        self.disks.batch.active().is_some_and(|active| {
+                            Some(active.token.card_id) == self.disks.selected
+                                && self
+                                    .disks
+                                    .cards
+                                    .get(&active.token.card_id)
+                                    .and_then(|data| data.live_snapshot.as_ref())
+                                    .is_some_and(|live| live.scan == snapshot.scan)
+                        })
+                    })
+            }),
             partial: self.explore.snapshot.as_ref().is_some_and(|s| {
-                s.root_entry.coverage.error_count > 0 || s.root_entry.coverage.unknown_entries > 0
+                !s.live
+                    && (s.root_entry.coverage.error_count > 0
+                        || s.root_entry.coverage.unknown_entries > 0)
             }),
             tree: self.explore.tree.clone(),
             tree_loading: self.explore.tree_loading,
@@ -712,7 +786,7 @@ impl Space {
             rows,
             list_selected: self.explore.list_selected,
             has_next_page: self.explore.list_next.is_some(),
-            on_later_page: self.explore.list_later_page,
+            on_later_page: self.explore.list_cursor.is_some(),
             selection_path: self.explore.selection_path.as_ref().map(|(_, p)| p.clone()),
             status: self.explore.status.clone(),
             new_scan_available: self.explore.new_scan_available.is_some(),

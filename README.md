@@ -7,6 +7,10 @@ A local-only desktop disk explorer, being built in Rust with GPUI.
 Space opens on **Home**. Choose **Scan all disks** once to scan discovered local
 sources serially, with progress and a nested mini map on each disk card. **Scan a
 folder…** handles a chosen local folder. Saved scans remain available offline.
+Open **Explore while scanning** as soon as a scan has observed its first entries.
+Browse discovered folders while their sizes update. Search and Largest files
+become available when the scan finishes. Stopped scans remain browsable with
+partial sizes for the current session.
 
 **Explore** puts a nested, squarified treemap below two thin bars. Click a tile to
 select it, click a folder header (or double-click its body) to zoom, and press

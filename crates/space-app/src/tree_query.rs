@@ -15,21 +15,21 @@ trait Source {
     fn children(&self, node: NodeId, limit: usize) -> Result<Page>;
 }
 struct Normal<'a> {
-    backend: &'a Backend,
+    reader: &'a CacheReader,
     scan: ScanId,
     metric: Metric,
 }
 impl Source for Normal<'_> {
     fn entry(&self, node: NodeId) -> Result<StoredEntry> {
-        read(self.backend)?.entry(self.scan, node).map_err(error)
+        self.reader.entry(self.scan, node).map_err(error)
     }
     fn summary(&self, node: NodeId, limit: usize) -> Result<ChildrenSummary> {
-        read(self.backend)?
+        self.reader
             .children_summary(self.scan, node, self.metric, limit)
             .map_err(error)
     }
     fn children(&self, node: NodeId, limit: usize) -> Result<Page> {
-        read(self.backend)?
+        self.reader
             .children_sorted(self.scan, node, self.metric, None, limit)
             .map_err(error)
     }
@@ -72,9 +72,11 @@ pub fn tree(
     budget: TreeBudget,
     abort: &TreeAbort,
 ) -> Result<Option<Tree>> {
+    let reader = read_scan(backend, scan)?;
+    let _transaction = reader.begin_read().map_err(error)?;
     assemble(
         &Normal {
-            backend,
+            reader: &reader,
             scan,
             metric,
         },
@@ -84,6 +86,39 @@ pub fn tree(
         abort,
     )
 }
+pub struct Scope {
+    pub tree: Tree,
+    pub rows: Queried,
+    pub totals: Vec<(NodeId, crate::display_totals::DisplayTotals)>,
+}
+
+pub fn scope(
+    backend: &Backend,
+    query: Query,
+    budget: TreeBudget,
+    ancestors: &[NodeId],
+    abort: &TreeAbort,
+) -> Result<Option<Scope>> {
+    if query.filtered.is_some() {
+        return Err("Scope assembly requires an unfiltered query.".into());
+    }
+    let reader = read_scan(backend, query.scan)?;
+    let _transaction = reader.begin_read().map_err(error)?;
+    let source = Normal {
+        reader: &reader,
+        scan: query.scan,
+        metric: query.metric,
+    };
+    let Some(tree) = assemble(&source, query.parent, query.metric, budget, abort)? else {
+        return Ok(None);
+    };
+    let rows = query_with_reader(&reader, query)?;
+    let Some(totals) = totals_for_source(&source, ancestors, abort)? else {
+        return Ok(None);
+    };
+    Ok(Some(Scope { tree, rows, totals }))
+}
+
 pub fn tree_filtered(
     filtered: &Filtered,
     parent: NodeId,
@@ -102,8 +137,10 @@ pub fn breadcrumb_totals(
     nodes: &[NodeId],
     abort: &TreeAbort,
 ) -> Result<Option<Vec<(NodeId, crate::display_totals::DisplayTotals)>>> {
+    let reader = read_scan(backend, scan)?;
+    let _transaction = reader.begin_read().map_err(error)?;
     let normal = Normal {
-        backend,
+        reader: &reader,
         scan,
         metric: Metric::Logical,
     };
@@ -111,6 +148,14 @@ pub fn breadcrumb_totals(
     let source: &dyn Source = filtered
         .as_ref()
         .map_or(&normal as &dyn Source, |f| f as &dyn Source);
+    totals_for_source(source, nodes, abort)
+}
+
+fn totals_for_source(
+    source: &dyn Source,
+    nodes: &[NodeId],
+    abort: &TreeAbort,
+) -> Result<Option<Vec<(NodeId, crate::display_totals::DisplayTotals)>>> {
     let mut totals = Vec::with_capacity(nodes.len());
     for &node in nodes {
         if abort.superseded() {
@@ -275,6 +320,57 @@ fn assemble(
 mod tests {
     use super::*;
     use crate::tree::{self, LayoutParams, Rect, Target};
+    #[test]
+    fn scope_publishes_matching_map_rows_and_breadcrumb_totals() {
+        let fixture = crate::test_fixture::Fixture::new();
+        let snapshot = open_root(&fixture.backend, fixture.roots[0].clone()).unwrap();
+        let parent = snapshot.root_entry.entry.node;
+        let abort = TreeAbort(Arc::new(AtomicU64::new(1)), 1);
+        let result = scope(
+            &fixture.backend,
+            Query {
+                scan: snapshot.scan,
+                parent,
+                view: View::Folders,
+                metric: Metric::Logical,
+                cursor: None,
+                filtered: None,
+            },
+            TreeBudget::EXPLORE,
+            &[parent],
+            &abort,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result.tree.total_bytes,
+            result.totals[0].1.bytes(Metric::Logical)
+        );
+        for row in result.rows.page.entries {
+            let tile = result.tree.find(row.entry.node).unwrap();
+            assert_eq!(tile.bytes, row.logical.observed_bytes);
+        }
+        abort.0.store(2, Ordering::Release);
+        assert!(
+            scope(
+                &fixture.backend,
+                Query {
+                    scan: snapshot.scan,
+                    parent,
+                    view: View::Folders,
+                    metric: Metric::Logical,
+                    cursor: None,
+                    filtered: None,
+                },
+                TreeBudget::EXPLORE,
+                &[parent],
+                &abort,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
     #[test]
     fn t4_nested_fixture_and_t6_budgets_and_abort() {
         let fixture = crate::test_fixture::Fixture::new();

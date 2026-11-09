@@ -1,6 +1,6 @@
 #[path = "tree_query.rs"]
 mod tree_query;
-pub use tree_query::{TreeAbort, breadcrumb_totals, tree, tree_filtered};
+pub use tree_query::{TreeAbort, breadcrumb_totals, scope, tree, tree_filtered};
 // Synchronous service boundary. Every function is called off the GPUI thread.
 use space_core::*;
 use space_store::{
@@ -18,14 +18,20 @@ use std::{
 
 #[derive(Clone)]
 pub struct Backend {
+    live: Arc<Mutex<std::collections::BTreeMap<ScanId, LiveReader>>>,
     writer: Arc<Mutex<Cache>>,
     reader: Arc<Mutex<CacheReader>>,
     filter_reader: Arc<Mutex<CacheReader>>,
+}
+struct LiveReader {
+    reader: CacheReader,
+    owner: std::sync::Weak<Snapshot>,
 }
 pub type Result<T> = std::result::Result<T, String>;
 pub const PAGE_SIZE: usize = 100;
 
 pub struct Snapshot {
+    pub live: bool,
     pub root: RootRecord,
     pub scan: ScanId,
     pub path: NativePath,
@@ -55,6 +61,47 @@ pub struct Query {
 pub struct Progress {
     pub entries: AtomicU64,
     pub batches: AtomicU64,
+    live: Mutex<Option<Arc<Snapshot>>>,
+    #[cfg(test)]
+    pub batch_hook: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+impl Progress {
+    pub fn take_live(&self) -> Option<Arc<Snapshot>> {
+        self.live
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+enum ReaderGuard<'a> {
+    Published(std::sync::MutexGuard<'a, CacheReader>),
+    Live(
+        std::sync::MutexGuard<'a, std::collections::BTreeMap<ScanId, LiveReader>>,
+        ScanId,
+    ),
+}
+impl std::ops::Deref for ReaderGuard<'_> {
+    type Target = CacheReader;
+    fn deref(&self) -> &CacheReader {
+        match self {
+            Self::Published(reader) => reader,
+            Self::Live(readers, scan) => &readers[scan].reader,
+        }
+    }
+}
+fn read_scan(backend: &Backend, scan: ScanId) -> Result<ReaderGuard<'_>> {
+    let readers = backend
+        .live
+        .lock()
+        .map_err(|_| "Live reader lock poisoned")?;
+    if readers.contains_key(&scan) {
+        Ok(ReaderGuard::Live(readers, scan))
+    } else {
+        drop(readers);
+        read(backend).map(ReaderGuard::Published)
+    }
 }
 
 fn lock(backend: &Backend) -> Result<std::sync::MutexGuard<'_, Cache>> {
@@ -96,6 +143,7 @@ fn timestamp() -> Result<Timestamp> {
 }
 fn snapshot(cache: &CacheReader, root: RootRecord, scan: ScanId) -> Result<Snapshot> {
     Ok(Snapshot {
+        live: false,
         path: cache.scan_path(scan).map_err(error)?,
         interval: cache.interval(scan).map_err(error)?,
         root_entry: cache.root_entry(scan).map_err(error)?,
@@ -111,6 +159,7 @@ pub fn open(directory: &Path) -> Result<Opened> {
     let roots = published_roots(&reader)?;
     Ok(Opened {
         backend: Backend {
+            live: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             writer: Arc::new(Mutex::new(cache)),
             reader: Arc::new(Mutex::new(reader)),
             filter_reader: Arc::new(Mutex::new(filter_reader)),
@@ -222,7 +271,13 @@ pub fn query(backend: &Backend, query: Query) -> Result<Queried> {
             display_paths,
         });
     }
-    let cache = read(backend)?;
+    let cache = read_scan(backend, query.scan)?;
+    let _transaction = cache.begin_read().map_err(error)?;
+    query_with_reader(&cache, query)
+}
+
+fn query_with_reader(cache: &CacheReader, query: Query) -> Result<Queried> {
+    let subtree = Some(query.parent);
     let page = match query.view {
         View::Folders => cache.children_sorted(
             query.scan,
@@ -361,6 +416,7 @@ pub fn scan(
             .map_err(error)?;
         spec
     };
+    let mut live_announced = false;
     let finish = space_scan::scan(
         &request.path,
         &spec,
@@ -382,8 +438,45 @@ pub fn scan(
                 .map_err(std::io::Error::other)?
                 .ingest(&batch)
                 .map_err(std::io::Error::other)?;
+            if !live_announced {
+                let reader = read(backend)
+                    .map_err(std::io::Error::other)?
+                    .live_reader(spec.key.id)
+                    .map_err(error)
+                    .map_err(std::io::Error::other)?;
+                let root = reader.root(spec.root_id).map_err(std::io::Error::other)?;
+                let mut live_snapshot =
+                    snapshot(&reader, root, spec.key.id).map_err(std::io::Error::other)?;
+                live_snapshot.live = true;
+                let live_snapshot = Arc::new(live_snapshot);
+                let mut readers = backend
+                    .live
+                    .lock()
+                    .map_err(|_| std::io::Error::other("Live reader lock poisoned"))?;
+                readers.retain(|_, view| view.owner.strong_count() > 0);
+                readers.insert(
+                    spec.key.id,
+                    LiveReader {
+                        reader,
+                        owner: Arc::downgrade(&live_snapshot),
+                    },
+                );
+                drop(readers);
+                *progress
+                    .live
+                    .lock()
+                    .map_err(|_| std::io::Error::other("Live progress lock poisoned"))? =
+                    Some(live_snapshot);
+                live_announced = true;
+            }
             progress.entries.fetch_add(entries, Ordering::Relaxed);
-            progress.batches.fetch_add(1, Ordering::Relaxed);
+            let batch = progress.batches.fetch_add(1, Ordering::Release) + 1;
+            #[cfg(test)]
+            if let Some(hook) = &progress.batch_hook {
+                hook(batch);
+            }
+            #[cfg(not(test))]
+            let _ = batch;
             Ok(())
         },
     );
@@ -422,7 +515,7 @@ pub fn scan(
 
 /// Rebuild only one selected path through its bounded parent chain; never use display text.
 pub fn native_path(backend: &Backend, snapshot: &Snapshot, node: NodeId) -> Result<PathBuf> {
-    read(backend)?
+    read_scan(backend, snapshot.scan)?
         .native_path(snapshot.scan, node)
         .map_err(error)?
         .to_path_buf()

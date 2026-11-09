@@ -449,6 +449,8 @@ pub fn render<T: 'static>(
                 )
                 .child(div().text_color(rgb(theme::ACCENT)).child(if card.opening {
                     "Opening…"
+                } else if enabled && matches!(card.status, Status::Scanning { .. }) {
+                    "Explore while scanning →"
                 } else if enabled {
                     "Explore →"
                 } else {

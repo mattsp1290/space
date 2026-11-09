@@ -962,4 +962,224 @@ fn review_ancestor_totals_follow_search_replace_clear_and_bookmark() {
     });
 }
 
+fn live_scan_journey(cancel_scan: bool, saved_rescan: bool) {
+    use std::sync::{Mutex, mpsc};
+    let mut j = Journey::new(true);
+    let path = if saved_rescan {
+        j.open(0);
+        j.fixture.directory.join("alpha")
+    } else {
+        j.fixture.directory.join("live")
+    };
+    std::fs::create_dir_all(path.join("growing")).unwrap();
+    for i in 0..800 {
+        std::fs::write(path.join(format!("growing/file-{i:04}.bin")), [0; 32]).unwrap();
+    }
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let done_tx = reached_tx.clone();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let mut progress = backend::Progress::default();
+    progress.batch_hook = Some(Arc::new(move |batch| {
+        reached_tx.send(batch).unwrap();
+        release_rx.lock().unwrap().recv().unwrap();
+    }));
+    let progress = Arc::new(progress);
+    let cancel = Cancellation::new();
+    let identity = space_scan::inspect_root(&path).unwrap();
+    let (card, token) = j.update(|app, _, cx| {
+        let card = app.disks.registry.register_folder(
+            space_core::NativePath::from_path(&path),
+            identity.clone(),
+            None,
+        );
+        let target = app.disks.registry.target(card).unwrap();
+        app.disks
+            .batch
+            .reduce(scan_batch::Event::ScanTargets(vec![target]));
+        let token = app.disks.batch.active().unwrap().token;
+        app.running = Some(Running {
+            cancel: cancel.clone(),
+            progress: progress.clone(),
+            generation: 99,
+            executor: cx.background_executor().clone(),
+            cancel_requested: false,
+            armed: false,
+        });
+        (card, token)
+    });
+    let worker_backend = j.fixture.backend.clone();
+    let cache_directory = j.fixture.cache_directory.clone();
+    let worker_progress = progress.clone();
+    let worker_cancel = cancel.clone();
+    let worker = std::thread::spawn(move || {
+        let result = backend::scan(
+            &worker_backend,
+            backend::ScanRequest {
+                path,
+                cache_directory,
+                expected_root: Some(identity),
+                refresh_root: None,
+                generation: 99,
+            },
+            &worker_cancel,
+            &worker_progress,
+        );
+        done_tx.send(0).unwrap();
+        result
+    });
+    reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    j.update(|app, _, cx| app.poll_live_scan(card, cx));
+    let ticket = j.read(|app| {
+        app.home_model()
+            .cards
+            .into_iter()
+            .find(|c| c.ticket.card == card)
+            .unwrap()
+            .ticket
+    });
+    let live_scan = ticket
+        .scan
+        .expect("first scan is browsable before publication");
+    j.read(|app| {
+        let live = app.disks.cards[&card].live_snapshot.as_ref().unwrap();
+        assert!(live.live);
+        assert!(backend::open_scan(&j.fixture.backend, live.root.clone(), live_scan).is_err());
+        if saved_rescan {
+            assert_eq!(
+                app.explore.snapshot.as_ref().unwrap().scan,
+                j.fixture.scans[0]
+            );
+            assert!(!app.explore.snapshot.as_ref().unwrap().live);
+        }
+    });
+    j.update(|app, w, cx| app.home_event(home::Event::Explore(ticket), w, cx));
+    j.settle();
+    j.frame();
+    assert!(j.visual().debug_bounds("explore-map").is_some());
+    let growing = j.node("growing");
+    j.action(Action::ZoomInto(growing));
+    j.settle();
+    let before = j.read(|app| app.explore.tree.clone().unwrap());
+    j.read(|app| {
+        assert!(app.explore_model().live);
+        assert!(app.explore_model().live_running);
+        assert!(
+            !app.explore_model()
+                .allows(&app.explore_model().event(Action::SearchChanged("x".into())))
+        );
+        assert!(
+            !app.explore_model().allows(
+                &app.explore_model()
+                    .event(Action::ListMode(explore::ListMode::Largest))
+            )
+        );
+    });
+    release_tx.send(()).unwrap();
+    reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    j.update(|app, _, cx| {
+        app.poll_live_scan(card, cx);
+        assert!(Arc::ptr_eq(app.explore.tree.as_ref().unwrap(), &before));
+        assert_eq!(app.explore.crumbs.last().unwrap().0, growing);
+    });
+    j.settle();
+    j.read(|app| {
+        assert_eq!(app.explore.crumbs.last().unwrap().0, growing);
+        assert!(app.explore.tree.as_ref().unwrap().total_bytes > before.total_bytes);
+    });
+    j.action(Action::NextPage);
+    j.settle();
+    let page_cursor = j.read(|app| app.explore.list_cursor.expect("second live page"));
+    j.update(|app, _, cx| {
+        assert!(app.refresh_live_scope(false, cx));
+    });
+    j.settle();
+    j.read(|app| {
+        assert_eq!(
+            app.explore
+                .list_cursor
+                .map(|cursor| (cursor.ordinal, cursor.value)),
+            Some((page_cursor.ordinal, page_cursor.value))
+        );
+        assert!(app.explore_model().on_later_page);
+    });
+    j.action(Action::Up);
+    j.settle();
+    j.action(Action::ZoomInto(growing));
+    j.settle();
+    if cancel_scan {
+        cancel.cancel();
+    }
+    release_tx.send(()).unwrap();
+    while reached_rx.recv_timeout(Duration::from_secs(10)).unwrap() != 0 {
+        release_tx.send(()).unwrap();
+    }
+    let result = worker.join().unwrap().unwrap();
+    j.update(|app, w, cx| {
+        assert!(app.refresh_live_scope(false, cx));
+        let next = app.explore_model().event(Action::NextPage);
+        assert!(app.explore_model().allows(&next));
+        app.explore_event(next, w, cx);
+        assert!(app.explore.pending.as_ref().unwrap().cursor.is_some());
+        let previous_generation = app.explore.query_generation;
+        app.running = None;
+        let outcome = if let Some(done) = result {
+            let scan = done.snapshot.scan;
+            app.roots = done.roots;
+            app.publish_card(card, done.snapshot, cx);
+            scan_batch::ScanOutcome::Published {
+                scan,
+                partial: false,
+            }
+        } else {
+            app.refresh_live_scope(true, cx);
+            scan_batch::ScanOutcome::Cancelled
+        };
+        assert!(app.explore.query_generation > previous_generation);
+        assert!(app.explore.pending.as_ref().unwrap().cursor.is_none());
+        assert_eq!(app.explore.pending.as_ref().unwrap().parent, growing);
+        app.disks
+            .batch
+            .reduce(scan_batch::Event::Finished { token, outcome });
+    });
+    j.settle();
+    j.read(|app| {
+        assert_eq!(app.explore.snapshot.as_ref().unwrap().scan, live_scan);
+        assert_eq!(app.explore.crumbs.last().unwrap().0, growing);
+        assert_eq!(app.explore.snapshot.as_ref().unwrap().live, cancel_scan);
+        assert!(!app.explore_model().live_running);
+        assert!(app.explore.list_cursor.is_none());
+        assert!(app.explore.tree.as_ref().unwrap().total_bytes > 0);
+    });
+    j.action(Action::Up);
+    j.settle();
+    j.action(Action::Crumb(j.read(|app| app.explore.crumbs[0].0)));
+    j.settle();
+    if cancel_scan {
+        j.update(|app, _, cx| {
+            let target = app.disks.registry.target(card).unwrap();
+            app.batch_event(scan_batch::Event::ScanTargets(vec![target]), cx);
+            assert_eq!(app.explore.snapshot.as_ref().unwrap().scan, live_scan);
+            assert!(!app.explore_model().live_running);
+            app.stop_acquisition(cx);
+        });
+        j.settle();
+    }
+}
+
+#[test]
+fn live_first_scan_can_be_opened_and_navigated_before_publication() {
+    live_scan_journey(false, false);
+}
+
+#[test]
+fn cancelled_live_scan_remains_browsable_with_partial_status() {
+    live_scan_journey(true, false);
+}
+
+#[test]
+fn live_rescan_does_not_replace_the_published_foreground() {
+    live_scan_journey(false, true);
+}
+
 mod fidelity;
