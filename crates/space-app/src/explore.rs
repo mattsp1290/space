@@ -40,6 +40,8 @@ pub struct Model {
     pub stopping: bool,
     pub offline: bool,
     pub partial: bool,
+    pub live: bool,
+    pub live_running: bool,
     pub tree: Option<Arc<tree::Tree>>,
     pub tree_loading: bool,
     pub selected: Option<NodeId>,
@@ -124,6 +126,7 @@ impl Model {
             return false;
         }
         match &event.action {
+            Action::SearchChanged(_) | Action::ListMode(ListMode::Largest) => !self.live,
             Action::Up => self.crumbs.len() > 1,
             Action::ZoomInto(n) => self.node(*n).is_some_and(|n| n.is_directory),
             Action::Select(Some(n)) => self.contains(*n),
@@ -271,7 +274,11 @@ pub fn render<T: 'static>(
             div()
                 .w(px(240.))
                 .flex_shrink_0()
-                .child(controls.search.clone()),
+                .when(!model.live, |d| d.child(controls.search.clone()))
+                .when(model.live, |d| {
+                    d.text_size(px(theme::TEXT_XS))
+                        .child("Search after scan finishes")
+                }),
         )
         .child(button(
             "clear-search",
@@ -287,7 +294,11 @@ pub fn render<T: 'static>(
                 .min_w_0()
                 .text_size(px(theme::TEXT_XS))
                 .truncate()
-                .child(if model.search_busy {
+                .child(if model.live_running {
+                    "Scanning · sizes so far".into()
+                } else if model.live {
+                    "Scan stopped · sizes so far".into()
+                } else if model.search_busy {
                     "Searching…".into()
                 } else {
                     model.matching.map_or_else(String::new, |n| {

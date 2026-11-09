@@ -14,6 +14,8 @@ use std::{
 pub(super) struct CardData {
     pub(super) scan: Option<ScanId>,
     pub(super) snapshot: Option<Arc<Snapshot>>,
+    pub(super) live_snapshot: Option<Arc<Snapshot>>,
+    live_batches: u64,
     preview: Option<Arc<tree::Tree>>,
     pub(super) epoch: u64,
     metric: Option<Metric>,
@@ -23,6 +25,11 @@ pub(super) struct CardData {
     error: Option<String>,
     pub(super) opening: bool,
     geometry: Rc<RefCell<Option<treemap_view::GeometryCache>>>,
+}
+impl CardData {
+    fn displayed_scan(&self) -> Option<ScanId> {
+        self.live_snapshot.as_ref().map(|s| s.scan).or(self.scan)
+    }
 }
 #[derive(Clone)]
 pub(super) struct Bookmark {
@@ -242,6 +249,10 @@ impl Space {
                 return;
             }
         };
+        let data = self.disks.cards.entry(token.card_id).or_default();
+        data.live_snapshot = None;
+        data.live_batches = 0;
+        data.epoch += 1;
         self.generation += 1;
         let generation = self.generation;
         let cancel = Cancellation::new();
@@ -275,6 +286,7 @@ impl Space {
                 {
                     return;
                 }
+                this.poll_live_scan(token.card_id, cx);
                 if let Some(run) = &mut this.running {
                     run.armed = false;
                 }
@@ -296,6 +308,12 @@ impl Space {
                     Ok(None) => ScanOutcome::Cancelled,
                     Err(error) => ScanOutcome::Failed(error),
                 };
+                if !matches!(outcome, ScanOutcome::Published { .. })
+                    && this.disks.selected == Some(token.card_id)
+                    && this.explore.snapshot.as_ref().is_some_and(|s| s.live)
+                {
+                    this.refresh_live_scope(true, cx);
+                }
                 this.batch_event(BatchEvent::Finished { token, outcome }, cx);
                 cx.notify();
             });
@@ -312,6 +330,7 @@ impl Space {
                             .as_ref()
                             .is_some_and(|run| run.generation == generation);
                         if active {
+                            this.poll_live_scan(token.card_id, cx);
                             cx.notify();
                         }
                         active
@@ -324,8 +343,41 @@ impl Space {
         })
         .detach();
     }
-    fn publish_card(&mut self, card: CardId, snapshot: Snapshot, cx: &mut Context<Self>) {
+    pub(super) fn poll_live_scan(&mut self, card: CardId, cx: &mut Context<Self>) {
+        let Some(run) = &self.running else { return };
+        let snapshot = run.progress.take_live();
+        let batches = run.progress.batches.load(Ordering::Acquire);
         let data = self.disks.cards.entry(card).or_default();
+        if let Some(snapshot) = snapshot {
+            data.live_snapshot = Some(snapshot);
+            data.epoch += 1;
+        }
+        if data.live_batches == batches {
+            return;
+        }
+        let displayed = data.live_snapshot.as_ref().is_some_and(|live| {
+            self.explore
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.live && s.scan == live.scan)
+        });
+        if !displayed || self.refresh_live_scope(false, cx) {
+            self.disks.cards.entry(card).or_default().live_batches = batches;
+        }
+    }
+    pub(super) fn publish_card(
+        &mut self,
+        card: CardId,
+        snapshot: Snapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let data = self.disks.cards.entry(card).or_default();
+        let was_live = self
+            .explore
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.live && s.scan == snapshot.scan);
+        data.live_snapshot = None;
         data.epoch += 1;
         data.scan = Some(snapshot.scan);
         data.dated = date(snapshot.interval.1.unwrap_or(snapshot.interval.0));
@@ -335,10 +387,15 @@ impl Space {
         data.metric = None;
         data.error = None;
         data.snapshot = Some(Arc::new(snapshot));
-        if self.disks.selected == Some(card) && self.screen == Screen::Explore {
+        if was_live {
+            self.explore.snapshot = data.snapshot.clone();
+            self.explore.list_next = None;
+            self.explore.list_cursor = None;
+            self.refresh_live_scope(true, cx);
+        } else if self.disks.selected == Some(card) && self.screen == Screen::Explore {
             self.explore.new_scan_available = data.scan;
         }
-        self.reconcile_disks(cx); // Deliberately does not navigate or replace the foreground explorer.
+        self.reconcile_disks(cx);
     }
     fn preview_ids(&self) -> Vec<CardId> {
         self.disks
@@ -614,14 +671,15 @@ impl Space {
         let Some(data) = self.disks.cards.get_mut(&ticket.card) else {
             return;
         };
-        if data.epoch != ticket.query_epoch || data.scan != ticket.scan || data.opening {
+        if data.epoch != ticket.query_epoch || data.displayed_scan() != ticket.scan || data.opening
+        {
             return;
         }
         let Some(scan) = ticket.scan else {
             return;
         };
         self.disks.open_request += 1;
-        if let Some(snapshot) = data.snapshot.clone() {
+        if let Some(snapshot) = data.live_snapshot.clone().or_else(|| data.snapshot.clone()) {
             self.commit_card(ticket.card, snapshot, cx);
             return;
         }
@@ -724,7 +782,7 @@ impl Space {
             .chain(self.disks.registry.cards().iter().filter(|c| !c.connected))
             .map(|card| {
                 let data = self.disks.cards.get(&card.id);
-                let scan = data.and_then(|d| d.scan);
+                let scan = data.and_then(CardData::displayed_scan);
                 let base = if !card.connected && scan.is_some() {
                     home::Status::Offline
                 } else if data.is_some_and(|d| d.partial) {

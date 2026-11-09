@@ -293,16 +293,19 @@ fn checked_aggregate_overflow_never_publishes() {
     basic(&mut c, 1);
     let s = spec(2);
     begin(&mut c, &s);
-    ingest(
-        &mut c,
-        &s,
-        vec![
-            entry(1, None, b"root", None, false),
-            entry(2, Some(1), b"a", Some(i64::MAX as u64), true),
-            entry(3, Some(1), b"b", Some(1), true),
-            finished(1),
-        ],
-    );
+    assert!(matches!(
+        c.ingest(&ScanBatch {
+            key: s.key,
+            sequence: 0,
+            records: vec![
+                entry(1, None, b"root", None, false),
+                entry(2, Some(1), b"a", Some(i64::MAX as u64), true),
+                entry(3, Some(1), b"b", Some(1), true),
+                finished(1),
+            ],
+        }),
+        Err(StoreError::Overflow)
+    ));
     assert!(
         c.publish(
             &ScanFinish {

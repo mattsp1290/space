@@ -1,10 +1,11 @@
-//! Exclusive, local SQLite cache. Only published snapshots are queryable.
+//! Exclusive, local SQLite cache with explicit provisional scan readers.
 //! APIs are synchronous: call them on a bounded background writer/query worker.
 mod comparison;
 pub use comparison::*;
 #[cfg(test)]
 mod comparison_tests;
 mod filters;
+mod live;
 mod maintenance;
 mod queries;
 pub use maintenance::{CacheFootprint, IssuePage, ScanInfo, ScanPage};
@@ -130,6 +131,7 @@ impl ScanPin {
     }
 }
 pub struct Cache {
+    live_scan: Option<ScanId>,
     maintenance_warning: Option<String>,
     conn: Connection,
     lock: Arc<File>,
@@ -141,6 +143,16 @@ pub struct CacheReader {
     cache: Cache,
 }
 impl CacheReader {
+    pub fn begin_read(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(self.cache.conn.unchecked_transaction()?)
+    }
+
+    pub fn live_reader(&self, scan: ScanId) -> Result<Self> {
+        self.cache.spec(scan)?;
+        let mut reader = self.cache.reader()?;
+        reader.cache.live_scan = Some(scan);
+        Ok(reader)
+    }
     pub fn latest(&self, root: RootId) -> Result<Option<ScanId>> {
         self.cache.latest(root)
     }
@@ -204,6 +216,7 @@ impl Cache {
         conn.execute_batch("PRAGMA query_only=ON; PRAGMA cache_size=-8192")?;
         Ok(CacheReader {
             cache: Cache {
+                live_scan: None,
                 conn,
                 lock: self.lock.clone(),
                 pins: self.pins.clone(),
@@ -278,6 +291,7 @@ impl Cache {
             [],
         )?;
         let mut cache = Self {
+            live_scan: None,
             maintenance_warning: None,
             conn,
             lock: Arc::new(lock),
@@ -549,6 +563,7 @@ impl Cache {
                 }
             }
         }
+        live::ingest(&tx, batch)?;
         tx.execute(
             "UPDATE scans SET next_sequence=? WHERE id=?",
             params![
@@ -652,6 +667,9 @@ impl Cache {
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
         let sid = scan.get();
+        tx.execute("DELETE FROM totals WHERE scan=?", [sid])?;
+        tx.execute("DELETE FROM child_sizes WHERE scan=?", [sid])?;
+        tx.execute("UPDATE entries SET canonical=1 WHERE scan=?", [sid])?;
         let root_node: i64 = tx.query_row(
             "SELECT node FROM entries WHERE scan=? AND parent IS NULL",
             [sid],
@@ -820,7 +838,7 @@ impl Cache {
         })
     }
     fn ensure_published(&self, scan: ScanId) -> Result<()> {
-        if self.status(scan)? != ScanStatus::Published {
+        if self.live_scan != Some(scan) && self.status(scan)? != ScanStatus::Published {
             return Err(StoreError::Invalid("snapshot is not published"));
         }
         Ok(())
